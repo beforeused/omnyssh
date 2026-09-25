@@ -1,48 +1,159 @@
 <div align="center">
 
-# OmnySSH
+# OmnySSH — форк от beforeused
 
-### Every server you manage, in one window. Dashboard, terminal, SFTP, snippets.
+### Десктопный SSH-клиент: дашборд, терминал, SFTP, сниппеты — с быстрым фоновым SFTP, drag & drop, своим редактором и русским интерфейсом
 
-<img src="assets/gui.webp" alt="OmnySSH GUI dashboard" width="900">
-
-[![Downloads](https://img.shields.io/github/downloads/timhartmann7/omnyssh/total?label=total%20installs&color=2ea44f)](https://github.com/timhartmann7/omnyssh/releases)
-[![Latest release](https://img.shields.io/github/v/release/timhartmann7/omnyssh?label=latest)](https://github.com/timhartmann7/omnyssh/releases/latest)
-[![Stars](https://img.shields.io/github/stars/timhartmann7/omnyssh?style=flat)](https://github.com/timhartmann7/omnyssh/stargazers)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Build](https://img.shields.io/github/actions/workflow/status/timhartmann7/omnyssh/ci.yml?branch=main)](https://github.com/timhartmann7/omnyssh/actions)
-
-**[Install](#install)** •
-**[Features](#features)** •
-**[SSH keys](#ssh-key-setup)** •
-**[Comparison](#comparison)** •
-**[TUI version](#the-tui-version)** •
-**[Telegram](#dev-notes)**
+<img src="assets/gui.webp" alt="OmnySSH" width="900">
 
 </div>
 
+> Это форк [**timhartmann7/omnyssh**](https://github.com/timhartmann7/omnyssh) (автор — Tim Hartmann, лицензия Apache 2.0).
+> Форк основан на коммите [`07726c0`](https://github.com/timhartmann7/omnyssh/commit/07726c06560d75acd4d33d4a8c2cc46495b261fd) оригинала; вся его история сохранена.
+> Разработчик форка — **beforeused**, Telegram: [@beforeused](https://t.me/beforeused).
+>
+> Все изменения касаются десктопного приложения (`crates/omnyssh-gui`) и общего ядра (`crates/omnyssh-core`). Терминальная версия (`omny`) работает как раньше.
+
 ---
 
-## Install
+## Что нового в форке
 
-One command on macOS and Linux:
+### SFTP: передачи в фоне и в разы быстрее
+
+В оригинале загрузка и скачивание шли через то же соединение, что и просмотр папок, строго по одному файлу, с ожиданием ответа сервера на каждые 64 КБ. На сервере с пингом 50 мс это давало около 1 МБ/с, а открыть папку во время загрузки было нельзя. В форке написан новый движок передачи ([`crates/omnyssh-core/src/ssh/transfer.rs`](crates/omnyssh-core/src/ssh/transfer.rs)):
+
+- **Отдельные соединения для передач.** 4 по умолчанию, от 1 до 8 в Настройки → Файлы. На каждом соединении по 2 SFTP-канала. Просмотр папок идёт по своему соединению и никогда не ждёт передачу.
+- **Конвейер запросов.** В полёте держится до ~8 МБ запросов вместо одного; размер запроса берётся из расширения `limits@openssh.com`.
+- **Большие файлы (от 16 МБ)** делятся на части, которые качаются параллельно через разные соединения.
+- **Мелкие файлы** идут пачками, до 16 одновременно на соединение.
+- **Папки целиком**, в обе стороны, с сохранением прав доступа файлов.
+- **Безопасная запись.** Новые большие файлы пишутся во временный `.имя.omnyssh-part` и переименовываются только после полной загрузки. Мелкие при сбое удаляются. При замене существующего файла на сервере данные пишутся в него на месте, поэтому владелец, права и симлинки сохраняются.
+- **Панель передач** под файлами: прогресс каждого файла, скорость, общий прогресс и оставшееся время, отмена, повтор, очистка. Закрыть вкладку с активными передачами можно только после подтверждения.
+
+Замеры на OpenSSH с задержкой 50 мс туда-обратно (4 соединения):
+
+| Операция | Оригинал | Форк |
+|---|---|---|
+| Загрузка файла 300 МБ | ~1,1 МБ/с | **~173 МБ/с** |
+| Скачивание файла 300 МБ | — | **~420 МБ/с** |
+| Загрузка 301 мелкого файла в 14 папках | — | **1,4 с** |
+
+### Drag & drop
+
+- Файлы и папки из Finder, Проводника или файлового менеджера перетаскиваются прямо в окно, и начинается загрузка на сервер. Если бросить на папку, файлы окажутся в ней.
+- Файлы перетаскиваются между локальной и серверной панелями в обе стороны.
+- Выделение работает как в файловом менеджере: клик, Shift+клик для диапазона, Cmd/Ctrl+клик, Cmd/Ctrl+A.
+- Правый клик: открыть, быстрый просмотр, загрузить/скачать, переименовать, удалить, новая папка, открыть терминал здесь.
+
+### Конфликты имён
+
+Если файл с таким именем уже есть, приложение спрашивает: **Заменить**, **Пропустить** или **Оставить оба** (новый файл сохранится как `имя (1).ext`). Галочка «Применить ко всем» отвечает сразу на все конфликты в пачке.
+
+### Свой редактор
+
+- В Настройки → Файлы выбирается, чем открывать файлы: системным приложением, найденным редактором (VS Code, Cursor, Zed, Sublime Text, BBEdit, Nova и другие), любым приложением через «Выбрать приложение…» или своей командой, например `code --wait {file}`.
+- Двойной клик открывает файл.
+- Файл с сервера скачивается и открывается в редакторе. После каждого сохранения появляется вопрос **«Файл изменён. Загрузить новую версию на сервер?»**.
+- Если файл за это время изменили на сервере, приложение ничего не перезаписывает и предлагает взять версию с сервера или перезаписать её.
+
+### Терминал рядом с файлами
+
+Кнопка терминала на панели сервера или **Ctrl+`** открывает шелл того же сервера под файловым менеджером, как в IDE.
+- Терминал стартует в папке, которую вы смотрите; кнопка `cd` возвращает его в текущую папку, а в контекстном меню есть «Открыть терминал здесь».
+- Высота меняется перетаскиванием верхнего края. Если терминал скрыть, сессия продолжает работать.
+
+### SSH-ключи
+
+В оригинале кнопка ключа сразу генерировала ключ, ставила его на сервер и отключала вход по паролю. В форке:
+
+- **Кнопка ключа есть на каждой карточке** и открывает диалог.
+- **Существующий ключ.** Ключи из `~/.ssh` находятся сами (по содержимому файла, а не по имени) и показываются карточками. Для ключа из другого места есть кнопка «Выбрать другой файл ключа…». Если рядом нет `.pub`, публичный ключ вычисляется из приватного.
+- **Новый ключ** создаётся с **вашим именем**, например `~/.ssh/deploy_prod`. Имя проверяется: без путей, служебных имён и совпадений с существующими ключами.
+- **Режим входа.** «Пароль и ключ» добавляет ключ и оставляет вход по паролю; если пароль был отключён, он включается обратно. «Только ключ» отключает вход по паролю, но только после того, как проверено, что ключ работает. Режим можно менять в любой момент.
+- **Ключ по умолчанию** (Настройки → SSH-ключи) используется для серверов без своего ключа и предлагается при установке.
+- **Форма сервера.** Ключ выбирается из найденных, рядом кнопка «Обзор» для файла в любой папке. Пароль необязателен.
+- **Серверы из `~/.ssh/config`** тоже можно настраивать: при установке ключа сохраняется ваша копия в `hosts.toml`, сам `~/.ssh/config` не меняется.
+
+### Русский интерфейс
+
+Настройки → Внешний вид → Язык: **English / Русский**. Переведён весь интерфейс, с правильными русскими формами множественного числа («1 передача», «3 передачи», «5 передач»). По умолчанию выбирается язык системы.
+
+### Исправления
+
+- **Проверка ключа при настройке теперь честная.** В оригинале проверочное подключение могло пройти через ssh-agent или другой ключ по умолчанию, а не через устанавливаемый. В режиме «только ключ» пароль мог отключиться, хотя новый ключ не работал. Теперь проверка идёт строго установленным ключом.
+- **Повторная установка ключа не дублирует строку** в `authorized_keys`.
+- **Исправлен устаревший e2e-тест терминала**, который падал ещё в оригинале (искал кнопку закрытия по неверной подписи).
+
+---
+
+## Что изменилось в поведении по сравнению с оригиналом
+
+| Было в оригинале | Стало в форке |
+|---|---|
+| Один клик по папке открывает её, по файлу — просмотр | Клик выделяет, двойной клик открывает (папку или файл в редакторе); быстрый просмотр в контекстном меню |
+| Передачи блокируют просмотр, одна за другой | Передачи в фоне, параллельно, по отдельным соединениям |
+| Передаются только файлы | Передаются и папки целиком |
+| Файл с тем же именем молча перезаписывается | Вопрос: заменить / пропустить / оставить оба |
+| Кнопка ключа только у серверов без ключа, всё делает сразу | Кнопка у всех серверов, диалог с выбором ключа, имени и режима входа |
+| Поле «Identity file» — путь вручную | Выбор из найденных ключей + «Обзор»; «ключ по умолчанию» |
+| Автопроверка обновлений на GitHub оригинала, её настройки в Settings | Выключена: лента релизов оригинала предлагала бы заменить форк оригиналом. Внизу настроек — блок «О приложении» |
+| Только английский | Английский и русский |
+
+Что ещё стоит знать:
+- **Дополнительные SSH-соединения.** Передачи открывают до 8 соединений к серверу (по умолчанию 4) и закрывают их через минуту простоя. Если на сервере жёстко ограничено число подключений (`MaxStartups`, fail2ban), уменьшите «Параллельные соединения» в настройках.
+- **Новый параметр `config.toml`.** В разделе `[general]` появился `default_identity_file` (ключ по умолчанию). Терминальная версия тоже его учитывает.
+- **Отдельные копии файлов для редактирования.** Файлы, открытые в редакторе, скачиваются в кэш приложения и удаляются при закрытии вкладки SFTP.
+- **Новые разрешения Tauri.** Добавлены `dialog:allow-open` и `dialog:allow-ask` для выбора файлов и подтверждений, а также ссылка `https://t.me/beforeused` для открытия во внешнем браузере.
+
+---
+
+## Сборка из исходников
+
+Готовые сборки форка публикуются в [Releases этого репозитория](https://github.com/beforeused/omnyssh/releases) (если они там есть). Команды установки из описания оригинала ниже (`install.sh`, Homebrew, `cargo install`, `nix run`) ставят **оригинальный** OmnySSH, а не форк.
+
+Нужны [Rust](https://rustup.rs) (stable), Node.js 20+ и npm. На Linux также понадобятся системные пакеты Tauri (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/timhartmann7/omnyssh/main/install.sh | sh
+git clone https://github.com/beforeused/omnyssh
+cd omnyssh/crates/omnyssh-gui/ui && npm ci && cd ..
+npx @tauri-apps/cli@^2 build            # macOS: .app и .dmg в target/release/bundle/
 ```
 
-The script detects your OS and architecture and installs the latest desktop build — into `/Applications` on macOS, your app menu on Linux. Want the terminal app instead, or both? `curl … | sh -s -- --tui` (or `--both`). Prefer clicking? Grab the file for your platform from [**Releases**](https://github.com/timhartmann7/omnyssh/releases/latest).
+Запуск в режиме разработки: `npx @tauri-apps/cli@^2 dev` из `crates/omnyssh-gui`.
 
-| Platform | File |
-|----------|------|
-| macOS Apple Silicon | `OmnySSH-aarch64-apple-darwin.dmg` |
-| macOS Intel | `OmnySSH-x86_64-apple-darwin.dmg` |
-| Linux x86_64 | `OmnySSH-x86_64.AppImage` / `.deb` / `.rpm` |
-| Windows x86_64 | `OmnySSH-x86_64-setup.exe` |
+Сборка не подписана сертификатом Apple Developer. Если macOS не даёт открыть скачанное приложение, откройте его через правый клик → «Открыть» или выполните `xattr -dr com.apple.quarantine /Applications/OmnySSH.app`.
 
-No account, no login screen, no telemetry. The app opens with an empty dashboard and reads your existing `~/.ssh/config` if you have one — hosts behind a bastion (`ProxyJump`) included.
+### Тесты
+
+```bash
+cargo test --workspace && cargo test -p omnyssh-gui       # Rust
+cd crates/omnyssh-gui/ui
+npx svelte-check && npx vitest run                          # фронтенд
+npx playwright test                                         # e2e (нужен браузер Playwright)
+```
+
+> Под Node 26 часть старых unit-тестов (тема, сайдбар) спотыкается о встроенный в Node `localStorage`. Запускайте с `NODE_OPTIONS=--no-experimental-webstorage`.
+
+### Где что лежит
+
+| Что | Где |
+|---|---|
+| Движок передачи файлов | `crates/omnyssh-core/src/ssh/transfer.rs` |
+| Поиск ключей в `~/.ssh` | `crates/omnyssh-core/src/ssh/keys.rs` |
+| Установка ключа: режимы, имя, строгая проверка | `crates/omnyssh-core/src/ssh/key_setup.rs`, `session.rs` |
+| Tauri-команды передач, редактора, ключей | `crates/omnyssh-gui/src/commands/{transfer,editor,keysetup}.rs` |
+| Синхронизация файлов из редактора | `crates/omnyssh-gui/src/edit.rs`, `editor.rs` |
+| SFTP-экран, панель передач, терминал | `crates/omnyssh-gui/ui/src/lib/screens/{SftpView,SftpPane,TransferPanel,TerminalPane}.svelte` |
+| Диалог ключа, выбор ключа | `.../screens/KeySetupDialog.svelte`, `.../components/KeyPicker.svelte` |
+| Переводы | `crates/omnyssh-gui/ui/src/lib/i18n/{en,ru}.ts` |
+
+Полный список изменений — в [CHANGELOG.md](CHANGELOG.md), раздел «Unreleased».
 
 ---
+
+# Об оригинальном OmnySSH
+
+Ниже — описание оригинального приложения из репозитория [timhartmann7/omnyssh](https://github.com/timhartmann7/omnyssh). Всё это в форке тоже есть.
 
 ## What it does
 
@@ -55,7 +166,7 @@ Cards for every host with CPU, RAM and disk bars, uptime, OS version, top proces
 Full PTY sessions in tabs. Open as many servers as you need, switch between them from the sidebar, and keep them running while you work in the dashboard.
 
 ### Two panel SFTP
-Local on the left, remote on the right. Tick the files you want and move them across, watch the progress bar, select many at once. Nobody remembers `scp -r` syntax anyway.
+Local on the left, remote on the right. Drag files between the panes, or straight from Finder onto the server. Whole folders move too, several connections at once, in the background: the queue at the bottom shows progress while you keep browsing. Double-click a file to open it in your own editor, and every save goes back to the server. Nobody remembers `scp -r` syntax anyway.
 
 ### Snippets
 Save the commands you paste every week. Pick a snippet, tick the hosts to send it to, and it runs on all of them at once. Snippets take parameters, so `sudo systemctl restart {{service}}` asks you for the name.
@@ -76,9 +187,9 @@ Around 130 MB of RAM with several sessions open, on a 20 MB download. Termius on
 
 ## SSH key setup
 
-Password auth on a fresh VPS is the thing you always mean to fix and never do. OmnySSH does it in one click.
+Password auth on a fresh VPS is the thing you always mean to fix and never do. OmnySSH does it from the server card.
 
-Pick a host you added yourself that has no key configured, hit **Set up SSH key**, and the app generates an Ed25519 key, appends the public half to `authorized_keys`, and switches the host over to key auth. It then opens a fresh connection with the new key to prove the key works, and only after that does it turn password login off. There is no confirmation step in between: starting the flow means going through with it.
+Hit the key button on any server, pick a key you already have (the app lists the ones in `~/.ssh`, and a folder button finds any other) or create a new Ed25519 one, and choose how the server should accept logins: **password and key**, or **key only**. The app appends the public half to `authorized_keys`, switches the host over to that key, and opens a fresh connection with that key alone to prove it works. Only after that does key-only mode turn password login off. Settings → SSH keys holds a default key for servers that have none of their own.
 
 Before touching `sshd_config` it saves a backup on the server. If any step fails, it restores the backup and leaves your access exactly as it was. Your private key never leaves your machine, and nothing gets sent anywhere except the server you chose.
 
