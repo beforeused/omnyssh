@@ -23,6 +23,10 @@ pub struct GeneralConfig {
     /// Path to the system SSH binary.
     pub ssh_command: String,
     pub max_concurrent_connections: usize,
+    /// Private key used for hosts that name none (before the built-in
+    /// `~/.ssh/id_*` fallbacks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_identity_file: Option<String>,
 }
 
 impl Default for GeneralConfig {
@@ -32,6 +36,7 @@ impl Default for GeneralConfig {
             default_shell: String::from("/bin/bash"),
             ssh_command: String::from("ssh"),
             max_concurrent_connections: 10,
+            default_identity_file: None,
         }
     }
 }
@@ -269,6 +274,14 @@ pub fn save_theme_to_config(theme_name: &str) -> anyhow::Result<()> {
 pub fn save_update_config(update: &UpdateConfig) -> anyhow::Result<()> {
     let update = update.clone();
     persist_config(move |config| config.update = update)
+}
+
+/// Saves the app-wide default SSH key (`None` clears it) to `[general]`.
+///
+/// # Errors
+/// Returns an error if the config file cannot be written or parsed.
+pub fn save_default_identity(path: Option<String>) -> anyhow::Result<()> {
+    persist_config(move |config| config.general.default_identity_file = path)
 }
 
 #[cfg(test)]

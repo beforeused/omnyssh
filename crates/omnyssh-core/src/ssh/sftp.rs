@@ -71,9 +71,18 @@ pub enum SftpCommand {
 ///
 /// Use [`SftpManager::connect`] to create, [`SftpManager::send`] to enqueue
 /// commands, and [`SftpManager::disconnect`] for a clean shutdown.
-#[derive(Debug)]
 pub struct SftpManager {
     cmd_tx: mpsc::Sender<SftpCommand>,
+    /// The browsing connection, shared with the desktop transfer engine for its
+    /// planning channel. The task holds its own clone; the connection closes once
+    /// both are gone.
+    session: SshSession,
+}
+
+impl std::fmt::Debug for SftpManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SftpManager").finish_non_exhaustive()
+    }
 }
 
 impl SftpManager {
@@ -98,6 +107,7 @@ impl SftpManager {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<SftpCommand>(64);
         let host_name = host.name.clone();
+        let shared_session = session.clone();
 
         // `session` and `sftp` are owned by this async block.  If the task
         // panics, Rust's unwind machinery calls their Drop impls before the
@@ -113,7 +123,15 @@ impl SftpManager {
             tracing::info!("SFTP task for '{}' exited", host_name);
         });
 
-        Ok(Self { cmd_tx })
+        Ok(Self {
+            cmd_tx,
+            session: shared_session,
+        })
+    }
+
+    /// A handle to the browsing SSH connection (for opening more channels on it).
+    pub fn ssh_session(&self) -> SshSession {
+        self.session.clone()
     }
 
     /// Enqueues a command (fire-and-forget). Silently drops if the task exited.

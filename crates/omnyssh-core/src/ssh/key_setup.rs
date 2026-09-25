@@ -67,6 +67,9 @@ pub enum KeySetupStep {
     DisablePassword = 4,
     ReloadSshd = 5,
     FinalCheck = 6,
+    /// "Password and key" mode on a server that had password logins off: turn them
+    /// back on. Takes step 4's place in that mode.
+    EnablePassword = 7,
 }
 
 impl KeySetupStep {
@@ -91,8 +94,41 @@ impl KeySetupStep {
             Self::DisablePassword => "Disabling password authentication",
             Self::ReloadSshd => "Reloading SSH service",
             Self::FinalCheck => "Final verification",
+            Self::EnablePassword => "Enabling password authentication",
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+/// Which key to install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySource {
+    /// Generate a new key pair in `~/.ssh` — named `file_name`, or
+    /// `omnyssh_<host>_<type>` by default. An existing pair of that name is reused.
+    Generate { file_name: Option<String> },
+    /// Install this existing private key (its `.pub`, or a public key derived
+    /// from it).
+    Existing(PathBuf),
+}
+
+/// How the server should accept logins once the key is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    /// The key works, and so does the password (re-enabled if it was off).
+    KeyAndPassword,
+    /// Only keys: password logins are disabled — never before the key is verified.
+    KeyOnly,
+}
+
+/// What [`setup_key_with_options`] does.
+#[derive(Debug, Clone)]
+pub struct KeySetupOptions {
+    pub key_type: KeyType,
+    pub source: KeySource,
+    pub mode: AuthMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +215,11 @@ impl KeySetupMachine {
                 // Failed to disable password — safe, stop here.
                 self.state = KeySetupState::FailedSafe;
             }
+            // Turning passwords back on only ever widens access: a failure leaves
+            // the server as it was.
+            (KeySetupStep::EnablePassword, Err(_)) => {
+                self.state = KeySetupState::FailedSafe;
+            }
 
             // Step 5 (ReloadSshd): Mostly safe (reload doesn't kill existing connections).
             (KeySetupStep::ReloadSshd, Err(_)) => {
@@ -233,7 +274,60 @@ impl Default for KeySetupMachine {
 pub async fn generate_key_pair(host_name: &str, key_type: KeyType) -> Result<(PathBuf, PathBuf)> {
     let sanitized = sanitize_hostname(host_name);
     let key_filename = format!("omnyssh_{}_{}", sanitized, key_type.extension());
+    generate_key_pair_file(&key_filename, host_name, key_type).await
+}
 
+/// Like [`generate_key_pair`], but saved as `~/.ssh/<file_name>` (and `.pub`).
+///
+/// # Errors
+/// An unsafe name (see [`validate_key_file_name`]), a private key of that name
+/// without its `.pub` (never overwritten), or a key generation / I/O failure.
+pub async fn generate_named_key_pair(
+    file_name: &str,
+    host_name: &str,
+    key_type: KeyType,
+) -> Result<(PathBuf, PathBuf)> {
+    let file_name = file_name.trim();
+    validate_key_file_name(file_name)?;
+    generate_key_pair_file(file_name, host_name, key_type).await
+}
+
+/// A key file name the user typed: a plain file name inside `~/.ssh` — no
+/// folders, no leading dot, no `.pub`, and only `A–Z a–z 0–9 . _ -`.
+///
+/// # Errors
+/// Describes what is wrong with the name.
+pub fn validate_key_file_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("The key name is empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!("The key name is longer than 64 characters");
+    }
+    if name.starts_with('.') || name.starts_with('-') {
+        anyhow::bail!("The key name cannot start with '.' or '-'");
+    }
+    if name.ends_with(".pub") {
+        anyhow::bail!("The key name cannot end with .pub");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        anyhow::bail!("The key name may only contain letters, digits, '.', '_' and '-'");
+    }
+    const RESERVED: &[&str] = &["config", "known_hosts", "authorized_keys", "environment"];
+    if RESERVED.contains(&name) || name.starts_with("known_hosts") {
+        anyhow::bail!("'{name}' is a file ssh already uses");
+    }
+    Ok(())
+}
+
+async fn generate_key_pair_file(
+    key_filename: &str,
+    host_name: &str,
+    key_type: KeyType,
+) -> Result<(PathBuf, PathBuf)> {
     let ssh_dir = dirs::home_dir()
         .ok_or_else(|| anyhow!("Cannot determine home directory"))?
         .join(".ssh");
@@ -252,8 +346,17 @@ pub async fn generate_key_pair(host_name: &str, key_type: KeyType) -> Result<(Pa
             .with_context(|| format!("Failed to set permissions on {}", ssh_dir.display()))?;
     }
 
-    let private_key_path = ssh_dir.join(&key_filename);
+    let private_key_path = ssh_dir.join(key_filename);
     let public_key_path = ssh_dir.join(format!("{}.pub", key_filename));
+
+    // A private key without its .pub is someone's key we cannot pair up: never
+    // hand it to ssh-keygen, which would offer to overwrite it.
+    if private_key_path.exists() && !public_key_path.exists() {
+        return Err(anyhow!(
+            "{} already exists — pick it under \"Use an existing key\" instead",
+            private_key_path.display()
+        ));
+    }
 
     // Check if key already exists - if so, reuse it instead of failing.
     if private_key_path.exists() && public_key_path.exists() {
@@ -382,20 +485,19 @@ pub fn build_authorized_keys_command(public_key: &str) -> String {
     if public_key.contains('\n') || public_key.contains('\r') || public_key.contains('\0') {
         panic!("Public key file contains invalid characters");
     }
-    if !public_key.starts_with("ssh-ed25519 ")
-        && !public_key.starts_with("ssh-rsa ")
-        && !public_key.starts_with("ecdsa-sha2-")
-    {
+    if crate::ssh::keys::validate_public_line(public_key).is_err() {
         panic!("Public key file has unrecognized key type");
     }
 
     // Escape single quotes in the public key.
     let escaped_key = public_key.replace('\'', "'\\''");
 
+    // Idempotent: a key that is already authorised is not appended again.
     format!(
         r#"mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
-           echo '{escaped_key}' >> ~/.ssh/authorized_keys && \
-           chmod 600 ~/.ssh/authorized_keys"#
+           touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && \
+           {{ grep -qxF -- '{escaped_key}' ~/.ssh/authorized_keys || \
+              echo '{escaped_key}' >> ~/.ssh/authorized_keys; }}"#
     )
 }
 
@@ -471,6 +573,28 @@ fn force_sshd_directive(directive: &str, value: &str) -> String {
     )
 }
 
+/// Builds the command to turn password authentication back on ("password and
+/// key" mode on a server where it was disabled). Backs the config up, forces
+/// `PasswordAuthentication yes` and `UsePAM yes` (the pair the key-only setup
+/// turned off), and validates with `sshd -t`, restoring the backup if it fails.
+pub fn build_enable_password_command() -> String {
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let password = force_sshd_directive("PasswordAuthentication", "yes");
+    let pam = force_sshd_directive("UsePAM", "yes");
+    format!(
+        r#"sudo -n true 2>/dev/null || {{ echo "OMNYSSH_NO_SUDO"; exit 1; }}; \
+           sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.omnyssh_backup.{timestamp} && \
+           {password} && \
+           {pam} && \
+           sudo sshd -t || {{ echo "OMNYSSH_CONFIG_ERROR"; sudo cp /etc/ssh/sshd_config.omnyssh_backup.{timestamp} /etc/ssh/sshd_config; exit 1; }}"#
+    )
+}
+
+/// Asks sshd for its effective password setting (needs passwordless sudo).
+/// Prints `passwordauthentication yes|no`, or nothing without sudo.
+const PROBE_PASSWORD_AUTH: &str =
+    "sudo -n sshd -T 2>/dev/null | grep -i '^passwordauthentication '";
+
 /// Builds the command to reload the SSH daemon.
 ///
 /// Uses `reload` instead of `restart` to avoid killing existing connections.
@@ -517,11 +641,32 @@ pub async fn setup_key_for_host(
     key_type: KeyType,
     progress_tx: Option<tokio::sync::mpsc::Sender<KeySetupStep>>,
 ) -> Result<KeySetupResult> {
+    let options = KeySetupOptions {
+        key_type,
+        source: KeySource::Generate { file_name: None },
+        mode: AuthMode::KeyOnly,
+    };
+    setup_key_with_options(host, password_session, &options, progress_tx).await
+}
+
+/// Installs a key on `host` with the given [`KeySetupOptions`]: a new or an
+/// existing key, and either key-only logins or key plus password.
+///
+/// # Errors
+/// As [`setup_key_for_host`]. Password authentication is never disabled unless
+/// the installed key was verified to log in on its own.
+pub async fn setup_key_with_options(
+    host: &Host,
+    password_session: &SshSession,
+    options: &KeySetupOptions,
+    progress_tx: Option<tokio::sync::mpsc::Sender<KeySetupStep>>,
+) -> Result<KeySetupResult> {
     let mut machine = KeySetupMachine::new();
     let mut result = KeySetupResult {
         key_path: PathBuf::new(),
         state: KeySetupState::NotStarted,
         error_message: None,
+        password_auth_disabled: None,
     };
 
     // The two verification steps reconnect, so they walk the host's ProxyJump
@@ -535,7 +680,7 @@ pub async fn setup_key_for_host(
         setup_key_internal(
             host,
             password_session,
-            key_type,
+            options,
             verify_timeout,
             &mut machine,
             progress_tx,
@@ -543,9 +688,10 @@ pub async fn setup_key_for_host(
     )
     .await
     {
-        Ok(Ok(key_path)) => {
+        Ok(Ok((key_path, password_disabled))) => {
             result.key_path = key_path;
             result.state = machine.state().clone();
+            result.password_auth_disabled = password_disabled;
             return Ok(result);
         }
         Ok(Err(e)) => {
@@ -589,21 +735,45 @@ pub async fn setup_key_for_host(
     Err(error)
 }
 
-/// Internal implementation of the key setup process.
+/// Internal implementation of the key setup process. Returns the installed key
+/// and, when known, whether the server now refuses password logins.
 async fn setup_key_internal(
     host: &Host,
     password_session: &SshSession,
-    key_type: KeyType,
+    options: &KeySetupOptions,
     verify_timeout: Duration,
     machine: &mut KeySetupMachine,
     progress_tx: Option<tokio::sync::mpsc::Sender<KeySetupStep>>,
-) -> Result<PathBuf> {
-    // Step 1: Generate key pair.
-    info!("Step 1/6: Generating key pair for {}", host.name);
+) -> Result<(PathBuf, Option<bool>)> {
+    // Step 1: Generate (or pick up) the key pair.
+    info!("Step 1/6: Preparing key pair for {}", host.name);
     if let Some(ref tx) = progress_tx {
         let _ = tx.send(KeySetupStep::GenerateKey).await;
     }
-    let (private_key_path, public_key_path) = match generate_key_pair(&host.name, key_type).await {
+    let prepared = match &options.source {
+        KeySource::Generate { file_name } => match file_name {
+            Some(name) => generate_named_key_pair(name, &host.name, options.key_type).await,
+            None => generate_key_pair(&host.name, options.key_type).await,
+        }
+        .and_then(|(private, public)| {
+            let line =
+                std::fs::read_to_string(&public).context("Failed to read public key file")?;
+            Ok((private, line.trim().to_string()))
+        }),
+        KeySource::Existing(path) => {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                if !path.is_file() {
+                    anyhow::bail!("Key file not found: {}", path.display());
+                }
+                let line = crate::ssh::keys::public_key_line(&path)?;
+                Ok((path, line))
+            })
+            .await
+            .context("key read task panicked")?
+        }
+    };
+    let (private_key_path, public_key_content) = match prepared {
         Ok(paths) => {
             machine.step_result(KeySetupStep::GenerateKey, Ok(()));
             paths
@@ -619,26 +789,15 @@ async fn setup_key_internal(
     if let Some(ref tx) = progress_tx {
         let _ = tx.send(KeySetupStep::CopyPublicKey).await;
     }
-    let public_key_content = tokio::fs::read_to_string(&public_key_path)
-        .await
-        .context("Failed to read public key file")?;
 
     // Validate public key format before embedding in shell command.
     let public_key_trimmed = public_key_content.trim();
-    if public_key_trimmed.contains('\n')
-        || public_key_trimmed.contains('\r')
-        || public_key_trimmed.contains('\0')
-    {
-        anyhow::bail!("Public key file contains invalid characters");
-    }
-    if !public_key_trimmed.starts_with("ssh-ed25519 ")
-        && !public_key_trimmed.starts_with("ssh-rsa ")
-        && !public_key_trimmed.starts_with("ecdsa-sha2-")
-    {
-        anyhow::bail!("Public key file has unrecognized key type");
+    if let Err(e) = crate::ssh::keys::validate_public_line(public_key_trimmed) {
+        machine.step_result(KeySetupStep::CopyPublicKey, Err(anyhow!("Copy failed")));
+        return Err(anyhow!("Public key file: {e}"));
     }
 
-    let copy_cmd = build_authorized_keys_command(&public_key_content);
+    let copy_cmd = build_authorized_keys_command(public_key_trimmed);
     match time::timeout(STEP_TIMEOUT, password_session.run_command(&copy_cmd)).await {
         Ok(Ok(_)) => {
             machine.step_result(KeySetupStep::CopyPublicKey, Ok(()));
@@ -653,7 +812,8 @@ async fn setup_key_internal(
         }
     }
 
-    // Step 3: Verify key authentication (CRITICAL).
+    // Step 3: Verify key authentication (CRITICAL). With this key and nothing
+    // else — the agent or a default key logging in would prove nothing.
     info!("Step 3/6: Verifying key authentication");
     if let Some(ref tx) = progress_tx {
         let _ = tx.send(KeySetupStep::VerifyKeyAuth).await;
@@ -662,7 +822,12 @@ async fn setup_key_internal(
     test_host.identity_file = Some(private_key_path.to_string_lossy().to_string());
     test_host.password = None; // Force key-only auth.
 
-    match time::timeout(verify_timeout, SshSession::connect(&test_host)).await {
+    match time::timeout(
+        verify_timeout,
+        SshSession::connect_with_key_only(&test_host, &private_key_path),
+    )
+    .await
+    {
         Ok(Ok(test_session)) => {
             info!("Key authentication verified successfully!");
             test_session.disconnect().await;
@@ -683,6 +848,19 @@ async fn setup_key_internal(
         }
     }
 
+    if options.mode == AuthMode::KeyAndPassword {
+        return ensure_password_enabled(
+            password_session,
+            &test_host,
+            &private_key_path,
+            verify_timeout,
+            machine,
+            progress_tx,
+        )
+        .await
+        .map(|disabled| (private_key_path, disabled));
+    }
+
     // Check sudo availability. `run_command_checked` is required here — the
     // probe's exit status is the answer, and plain `run_command` ignores it.
     info!("Checking sudo availability");
@@ -697,7 +875,7 @@ async fn setup_key_internal(
             warn!("No sudo access — password authentication will NOT be disabled");
             machine.set_has_sudo(false);
             machine.step_result(KeySetupStep::VerifyKeyAuth, Ok(())); // Trigger PartialSuccess.
-            return Ok(private_key_path);
+            return Ok((private_key_path, None));
         }
     }
 
@@ -711,7 +889,7 @@ async fn setup_key_internal(
         Ok(Ok(output)) if output.contains("OMNYSSH_NO_SUDO") => {
             machine.set_has_sudo(false);
             machine.step_result(KeySetupStep::VerifyKeyAuth, Ok(()));
-            return Ok(private_key_path);
+            return Ok((private_key_path, None));
         }
         Ok(Ok(output)) if output.contains("OMNYSSH_CONFIG_ERROR") => {
             machine.step_result(KeySetupStep::DisablePassword, Err(anyhow!("Config error")));
@@ -763,12 +941,17 @@ async fn setup_key_internal(
     if let Some(ref tx) = progress_tx {
         let _ = tx.send(KeySetupStep::FinalCheck).await;
     }
-    match time::timeout(verify_timeout, SshSession::connect(&test_host)).await {
+    match time::timeout(
+        verify_timeout,
+        SshSession::connect_with_key_only(&test_host, &private_key_path),
+    )
+    .await
+    {
         Ok(Ok(final_session)) => {
             info!("Final verification passed! Key setup complete.");
             final_session.disconnect().await;
             machine.step_result(KeySetupStep::FinalCheck, Ok(()));
-            Ok(private_key_path)
+            Ok((private_key_path, Some(true)))
         }
         Ok(Err(e)) => {
             error!(
@@ -787,6 +970,95 @@ async fn setup_key_internal(
                 "Final verification timed out after disabling password. Attempting rollback."
             ))
         }
+    }
+}
+
+/// Why "password and key" mode could not turn passwords back on.
+const NEEDS_SUDO: &str =
+    "Enabling password logins needs passwordless sudo on the server. The key is installed.";
+
+/// "Password and key" mode, after the key is verified: make sure the server
+/// still accepts passwords, turning them back on if an earlier key-only setup
+/// (or anything else) disabled them. Returns whether passwords are refused
+/// (`Some(false)` once confirmed on; `None` when sshd could not be asked —
+/// without passwordless sudo there is nothing to change either way).
+async fn ensure_password_enabled(
+    password_session: &SshSession,
+    test_host: &Host,
+    key_path: &std::path::Path,
+    verify_timeout: Duration,
+    machine: &mut KeySetupMachine,
+    progress_tx: Option<tokio::sync::mpsc::Sender<KeySetupStep>>,
+) -> Result<Option<bool>> {
+    let probe = time::timeout(
+        STEP_TIMEOUT,
+        password_session.run_command(PROBE_PASSWORD_AUTH),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default()
+    .to_lowercase();
+    if probe.contains("passwordauthentication yes") {
+        machine.step_result(KeySetupStep::FinalCheck, Ok(()));
+        return Ok(Some(false));
+    }
+    if !probe.contains("passwordauthentication no") {
+        // No sudo (or no sshd -T): the key is installed; logins are as they were.
+        info!("Could not read sshd's password setting; leaving it unchanged");
+        machine.step_result(KeySetupStep::FinalCheck, Ok(()));
+        return Ok(None);
+    }
+
+    info!("Password authentication is off — enabling it");
+    if let Some(ref tx) = progress_tx {
+        let _ = tx.send(KeySetupStep::EnablePassword).await;
+    }
+    let enable = time::timeout(
+        STEP_TIMEOUT,
+        password_session.run_command(&build_enable_password_command()),
+    )
+    .await;
+    match enable {
+        Ok(Ok(out)) if out.contains("OMNYSSH_NO_SUDO") => return Err(anyhow!(NEEDS_SUDO)),
+        Ok(Ok(out)) if out.contains("OMNYSSH_CONFIG_ERROR") => {
+            return Err(anyhow!("sshd config validation failed. Backup restored."))
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(anyhow!("Failed to enable password authentication: {e}")),
+        Err(_) => return Err(anyhow!("Failed to enable password authentication: timeout")),
+    }
+
+    if let Some(ref tx) = progress_tx {
+        let _ = tx.send(KeySetupStep::ReloadSshd).await;
+    }
+    match time::timeout(
+        STEP_TIMEOUT,
+        password_session.run_command(&build_reload_sshd_command()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(anyhow!("Failed to reload SSH daemon: {e}")),
+        Err(_) => return Err(anyhow!("Failed to reload SSH daemon: timeout")),
+    }
+
+    if let Some(ref tx) = progress_tx {
+        let _ = tx.send(KeySetupStep::FinalCheck).await;
+    }
+    match time::timeout(
+        verify_timeout,
+        SshSession::connect_with_key_only(test_host, key_path),
+    )
+    .await
+    {
+        Ok(Ok(session)) => {
+            session.disconnect().await;
+            machine.step_result(KeySetupStep::FinalCheck, Ok(()));
+            Ok(Some(false))
+        }
+        Ok(Err(e)) => Err(anyhow!("The key stopped working after the reload: {e}")),
+        Err(_) => Err(anyhow!("The key check timed out after the reload")),
     }
 }
 
@@ -821,6 +1093,8 @@ pub struct KeySetupResult {
     pub state: KeySetupState,
     /// Error message if the setup failed.
     pub error_message: Option<String>,
+    /// Whether the server now refuses password logins, when known.
+    pub password_auth_disabled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -830,6 +1104,30 @@ pub struct KeySetupResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_file_names_are_plain_files_in_dot_ssh() {
+        for ok in ["work", "id_ed25519_github", "prod-2024.key"] {
+            assert!(validate_key_file_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "../id",
+            "a/b",
+            ".hidden",
+            "-rf",
+            "key.pub",
+            "known_hosts",
+            "config",
+            "имя",
+            "a b",
+        ] {
+            assert!(
+                validate_key_file_name(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
 
     #[test]
     fn test_sanitize_hostname() {

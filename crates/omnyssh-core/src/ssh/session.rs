@@ -12,6 +12,7 @@
 //! - Connect timeout: 10 seconds (per hop)
 //! - Command timeout: 30 seconds
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -169,6 +170,33 @@ impl SshSession {
         })
     }
 
+    /// Connect to `host` authenticating with `key_path` **only** — no agent, no
+    /// default keys, no password. Proves that this particular key is accepted, which
+    /// key setup must know before it turns password logins off. Bastions on the
+    /// way authenticate as usual.
+    ///
+    /// # Errors
+    /// As [`SshSession::connect`]; authentication fails unless the key is accepted.
+    pub async fn connect_with_key_only(host: &Host, key_path: &Path) -> anyhow::Result<Self> {
+        let policy = AuthPolicy::OnlyKey(key_path.to_path_buf());
+        Ok(Self {
+            handle: Arc::new(connect_and_auth_with(host, client_config(), &policy).await?),
+        })
+    }
+
+    /// Like [`SshSession::connect`], tuned for bulk data: a large receive window
+    /// so downloads are not throttled by flow control on high-latency links.
+    ///
+    /// # Errors
+    /// As [`SshSession::connect`].
+    pub async fn connect_bulk(host: &Host) -> anyhow::Result<Self> {
+        Ok(Self {
+            handle: Arc::new(
+                connect_and_auth_with(host, bulk_client_config(), &AuthPolicy::Any).await?,
+            ),
+        })
+    }
+
     /// Execute a shell command on the remote host and return its stdout.
     ///
     /// A new SSH channel is opened for each call so sessions can be
@@ -264,26 +292,41 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Connection timeout (> 10 s per hop), host-key rejection, authentication
 /// failure, or an unresolvable `ProxyJump` chain.
 pub(crate) async fn connect_and_auth(host: &Host) -> anyhow::Result<SshConnection> {
+    connect_and_auth_with(host, client_config(), &AuthPolicy::Any).await
+}
+
+/// Which credentials the target host may be authenticated with.
+enum AuthPolicy {
+    /// Agent → identity file → default key → built-in key files → password.
+    Any,
+    /// This one private key and nothing else.
+    OnlyKey(PathBuf),
+}
+
+async fn connect_and_auth_with(
+    host: &Host,
+    config: Arc<client::Config>,
+    policy: &AuthPolicy,
+) -> anyhow::Result<SshConnection> {
     let chain = jump_chain(host).await?;
-    let config = client_config();
 
     // Walk the bastions outward: the first is reached directly, every later one
     // through its predecessor. The target then rides the last hop.
     let mut jumps: Vec<Handle<KnownHostsHandler>> = Vec::with_capacity(chain.len());
     for hop in &chain {
         let handle = match jumps.last() {
-            None => connect_direct(&config, hop).await,
-            Some(via) => connect_tunnelled(&config, via, hop).await,
+            None => connect_direct(&config, hop, &AuthPolicy::Any).await,
+            Some(via) => connect_tunnelled(&config, via, hop, &AuthPolicy::Any).await,
         }
         .map_err(|e| anyhow!("ProxyJump via '{}' failed: {e:#}", hop.name))?;
         jumps.push(handle);
     }
 
     let handle = match (jumps.last(), chain.last()) {
-        (Some(via), Some(last)) => connect_tunnelled(&config, via, host)
+        (Some(via), Some(last)) => connect_tunnelled(&config, via, host, policy)
             .await
             .map_err(|e| anyhow!("connecting via '{}' failed: {e:#}", last.name))?,
-        _ => connect_direct(&config, host).await?,
+        _ => connect_direct(&config, host, policy).await?,
     };
 
     Ok(SshConnection {
@@ -306,9 +349,27 @@ pub(crate) async fn connect_budget(host: &Host) -> Duration {
     CONNECT_TIMEOUT * (hops as u32 + 1)
 }
 
+/// Receive window for bulk-transfer connections. russh's 2 MiB default caps a
+/// single download channel at window / RTT (~40 MB/s at 50 ms); 16 MiB keeps the
+/// sender busy across long, fast links.
+const BULK_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// [`client_config`] with a large receive window, for the transfer engine.
+fn bulk_client_config() -> Arc<client::Config> {
+    Arc::new(client::Config {
+        window_size: BULK_WINDOW,
+        ..base_config()
+    })
+}
+
 /// The shared russh client configuration (timeouts + keepalives).
 fn client_config() -> Arc<client::Config> {
-    Arc::new(client::Config {
+    Arc::new(base_config())
+}
+
+/// Timeouts + keepalives shared by every connection kind.
+fn base_config() -> client::Config {
+    client::Config {
         // No inactivity timeout: russh skips resetting it on the iteration that
         // sends a keepalive, so a peer that never answers `keepalive@openssh.com`
         // (common in appliance SSH stacks) was torn down after 30 s even while
@@ -316,7 +377,7 @@ fn client_config() -> Arc<client::Config> {
         keepalive_interval: Some(Duration::from_secs(15)),
         keepalive_max: 3,
         ..Default::default()
-    })
+    }
 }
 
 /// Resolves `host`'s `ProxyJump` into the hops to connect before it.
@@ -353,6 +414,7 @@ async fn jump_chain(host: &Host) -> anyhow::Result<Vec<Host>> {
 async fn connect_direct(
     config: &Arc<client::Config>,
     host: &Host,
+    policy: &AuthPolicy,
 ) -> anyhow::Result<Handle<KnownHostsHandler>> {
     let addr = format!("{}:{}", host.hostname, host.port);
     let handle = time::timeout(
@@ -363,7 +425,7 @@ async fn connect_direct(
     .map_err(|_| anyhow!("SSH connection timed out (10 s)"))?
     .context("SSH connection failed")?;
 
-    finish_auth(handle, host).await
+    finish_auth(handle, host, policy).await
 }
 
 /// Reaches `host` through the already-connected bastion `via`: a `direct-tcpip`
@@ -373,6 +435,7 @@ async fn connect_tunnelled(
     config: &Arc<client::Config>,
     via: &Handle<KnownHostsHandler>,
     host: &Host,
+    policy: &AuthPolicy,
 ) -> anyhow::Result<Handle<KnownHostsHandler>> {
     // The originator address is informational; ssh(1) reports the loopback it
     // forwards from, and servers only log it.
@@ -400,7 +463,7 @@ async fn connect_tunnelled(
     .map_err(|_| anyhow!("SSH connection timed out (10 s)"))?
     .context("SSH connection failed")?;
 
-    finish_auth(handle, host).await
+    finish_auth(handle, host, policy).await
 }
 
 /// The host-key verifier for `host`. The lookup uses the target's own
@@ -417,8 +480,15 @@ fn known_hosts_handler(host: &Host) -> KnownHostsHandler {
 async fn finish_auth(
     mut handle: Handle<KnownHostsHandler>,
     host: &Host,
+    policy: &AuthPolicy,
 ) -> anyhow::Result<Handle<KnownHostsHandler>> {
-    if !authenticate(&mut handle, host).await? {
+    let ok = match policy {
+        AuthPolicy::Any => authenticate(&mut handle, host).await?,
+        AuthPolicy::OnlyKey(path) => {
+            try_key_auth(&mut handle, &host.user, &path.to_string_lossy()).await?
+        }
+    };
+    if !ok {
         return Err(anyhow!("SSH authentication failed for {}", host.name));
     }
     Ok(handle)
@@ -448,7 +518,17 @@ async fn authenticate(handle: &mut Handle<KnownHostsHandler>, host: &Host) -> an
         }
     }
 
-    // 3. Try default key files — mirrors what the `ssh` binary does when no
+    // 3. The app-wide default key (Settings), for hosts that name none.
+    if host.identity_file.is_none() {
+        if let Some(key_path) = default_identity() {
+            let path = expand_tilde(&key_path);
+            if try_key_auth(handle, &user, &path).await.unwrap_or(false) {
+                return Ok(true);
+            }
+        }
+    }
+
+    // 4. Try default key files — mirrors what the `ssh` binary does when no
     //    -i flag is given. Skips files that don't exist.
     for key_path in default_key_paths() {
         if key_path.exists() {
@@ -462,7 +542,7 @@ async fn authenticate(handle: &mut Handle<KnownHostsHandler>, host: &Host) -> an
         }
     }
 
-    // 4. Try password authentication if provided.
+    // 5. Try password authentication if provided.
     //    Password auth is NOT recommended for production use but is required for
     //    the initial connection before setting up key-based auth.
     if let Some(password) = &host.password {
@@ -479,6 +559,32 @@ async fn authenticate(handle: &mut Handle<KnownHostsHandler>, host: &Host) -> an
     }
 
     Ok(false)
+}
+
+/// The app-wide default key, `None` until set. Read from `config.toml` on first
+/// use; [`set_default_identity`] replaces it (and is what the settings screen
+/// calls after saving).
+static DEFAULT_IDENTITY: std::sync::RwLock<Option<Option<String>>> = std::sync::RwLock::new(None);
+
+fn default_identity() -> Option<String> {
+    if let Some(cached) = DEFAULT_IDENTITY.read().ok().and_then(|g| g.clone()) {
+        return cached;
+    }
+    let loaded = crate::config::app_config::load_app_config(None)
+        .ok()
+        .and_then(|c| c.general.default_identity_file)
+        .filter(|p| !p.trim().is_empty());
+    if let Ok(mut guard) = DEFAULT_IDENTITY.write() {
+        *guard = Some(loaded.clone());
+    }
+    loaded
+}
+
+/// Replace the in-memory app-wide default key (after it was saved to config).
+pub fn set_default_identity(path: Option<String>) {
+    if let Ok(mut guard) = DEFAULT_IDENTITY.write() {
+        *guard = Some(path.filter(|p| !p.trim().is_empty()));
+    }
 }
 
 /// Returns the standard default SSH private key paths in priority order.
