@@ -4,11 +4,12 @@
 //! forwarder (`forward_terminal_output`) into the per-session channels (§3.6).
 
 use omnyssh_core::event::{CoreEvent, SessionId};
+use omnyssh_core::ssh::transfer::TransferUpdate;
 use tauri::{AppHandle, Manager};
 use tauri_specta::Event;
 use tokio::sync::mpsc;
 
-use crate::dto::{FileEntryDto, TransferProgressDto};
+use crate::dto::{FileEntryDto, TransferUpdateDto};
 use crate::events;
 use crate::state::GuiState;
 
@@ -64,6 +65,8 @@ pub async fn forward_core_events(app: AppHandle, mut rx: mpsc::Receiver<CoreEven
                 let _ = events::KeySetupComplete {
                     host_name,
                     key_path: key_path.to_string_lossy().to_string(),
+                    password_auth_disabled: None,
+                    partial: false,
                 }
                 .emit(&app);
             }
@@ -105,7 +108,6 @@ enum SftpOutbound {
     OpDone(events::SftpOpDone),
     Disconnected(events::SftpDisconnected),
     Preview(events::FilePreview),
-    Progress(events::TransferProgress),
 }
 
 impl SftpOutbound {
@@ -116,7 +118,6 @@ impl SftpOutbound {
             SftpOutbound::OpDone(e) => e.emit(app),
             SftpOutbound::Disconnected(e) => e.emit(app),
             SftpOutbound::Preview(e) => e.emit(app),
-            SftpOutbound::Progress(e) => e.emit(app),
         };
     }
 }
@@ -160,41 +161,40 @@ fn map_sftp_event(session_id: SessionId, event: CoreEvent) -> Option<SftpOutboun
                 content,
             })
         }
-        CoreEvent::FileTransferProgress(transfer_id, done, total) => {
-            SftpOutbound::Progress(events::TransferProgress(TransferProgressDto {
-                session_id,
-                transfer_id,
-                done,
-                total,
-            }))
-        }
-        // Not produced on a per-session SFTP channel (`SftpManagerReady` is TUI-only).
+        // Not produced on a per-session SFTP channel: `SftpManagerReady` is TUI-only,
+        // and the GUI moves files through the transfer engine (`forward_transfer_updates`).
         _ => return None,
     })
 }
 
 /// Per-session SFTP forwarder (§3.4): drains a tab's dedicated core-event channel,
 /// stamps each event with the tab's `session_id`, and emits the typed IPC event.
-/// Transfer progress is attributed to its owner via `transfer_owner` (the
-/// GUI-allocated transfer id's session). Ends when the core task drops its sender.
+/// Ends when the core task drops its sender.
 pub async fn forward_sftp_events(
     app: AppHandle,
     session_id: SessionId,
     mut rx: mpsc::Receiver<CoreEvent>,
 ) {
     while let Some(event) = rx.recv().await {
-        // A transfer's owner comes from `transfer_owner`; every other event is stamped
-        // with this forwarder's own session (§3.4).
-        let owner = match &event {
-            CoreEvent::FileTransferProgress(transfer_id, _, _) => app
-                .state::<GuiState>()
-                .transfer_session(*transfer_id)
-                .unwrap_or(session_id),
-            _ => session_id,
-        };
-        if let Some(outbound) = map_sftp_event(owner, event) {
+        if let Some(outbound) = map_sftp_event(session_id, event) {
             outbound.emit(&app);
         }
+    }
+}
+
+/// Per-session transfer forwarder: stamps the engine's batched progress with the
+/// tab's session id. Ends when the engine (and its reporter) is dropped.
+pub async fn forward_transfer_updates(
+    app: AppHandle,
+    session_id: SessionId,
+    mut rx: mpsc::Receiver<Vec<TransferUpdate>>,
+) {
+    while let Some(batch) = rx.recv().await {
+        let _ = events::TransfersUpdated {
+            session_id,
+            updates: batch.iter().map(TransferUpdateDto::from).collect(),
+        }
+        .emit(&app);
     }
 }
 
@@ -254,18 +254,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_carries_the_resolved_owner_and_transfer_id() {
-        match map_sftp_event(7, CoreEvent::FileTransferProgress(42, 512, 2048)).unwrap() {
-            SftpOutbound::Progress(events::TransferProgress(dto)) => {
-                assert_eq!(dto.session_id, 7);
-                assert_eq!(dto.transfer_id, 42);
-                assert_eq!((dto.done, dto.total), (512, 2048));
-            }
-            _ => panic!("expected Progress"),
-        }
-    }
-
-    #[test]
     fn op_done_flattens_ok_and_error() {
         match map_sftp_event(1, CoreEvent::SftpOpDone { result: Ok(()) }).unwrap() {
             SftpOutbound::OpDone(e) => {
@@ -295,5 +283,8 @@ mod tests {
         // A terminal render-nudge would never arrive here, but the catch-all keeps the
         // forwarder robust and the match exhaustive without inventing an event (§3.4).
         assert!(map_sftp_event(1, CoreEvent::PtyOutput(3)).is_none());
+        // Nor does the core's sequential-transfer progress: the GUI moves files
+        // through the transfer engine, which reports on its own channel.
+        assert!(map_sftp_event(1, CoreEvent::FileTransferProgress(1, 2, 3)).is_none());
     }
 }

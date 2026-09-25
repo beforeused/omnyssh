@@ -6,8 +6,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dto::{
-    ConnectionStatusDto, FileEntryDto, HostDto, KeySetupStepDto, MetricsDto, ServiceDto,
-    TransferProgressDto, UpdateInfoDto,
+    ConnectionStatusDto, EditSyncStateDto, FileEntryDto, HostDto, KeySetupStepDto, MetricsDto,
+    ServiceDto, TransferUpdateDto, UpdateInfoDto,
 };
 
 /// Full host list broadcast. Emitted by `reload_hosts` after refreshing the
@@ -120,10 +120,26 @@ pub struct FilePreview {
     pub content: String,
 }
 
-/// Live transfer progress (tech-gui.md §4.3). The payload is `TransferProgressDto`,
-/// routed to its owning session via `transfer_owner` (§3.4/§4.1).
+/// Batched progress for one SFTP tab's transfer queue. The engine reports a few
+/// times a second, carrying only the transfers that changed since the last batch.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
-pub struct TransferProgress(pub TransferProgressDto);
+#[serde(rename_all = "camelCase")]
+pub struct TransfersUpdated {
+    pub session_id: u64,
+    pub updates: Vec<TransferUpdateDto>,
+}
+
+/// A remote file open in an external editor was saved locally and is being (or
+/// was) pushed back, or needs the user because the server copy changed too.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSync {
+    pub session_id: u64,
+    pub remote_path: String,
+    pub state: EditSyncStateDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 
 /// A progress step of an auto key-setup run (tech-gui.md §4.3). Mapped by the shared
 /// engine bridge from `CoreEvent::KeySetupProgress`; the host name identifies the run.
@@ -141,6 +157,12 @@ pub struct KeySetupProgress {
 pub struct KeySetupComplete {
     pub host_name: String,
     pub key_path: String,
+    /// Whether the server now refuses password logins, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_auth_disabled: Option<bool>,
+    /// Key-only was asked for but the key could only be installed (no sudo to
+    /// turn passwords off).
+    pub partial: bool,
 }
 
 /// Key setup failed before touching the server's auth config (tech-gui.md §4.3).

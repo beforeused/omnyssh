@@ -9,18 +9,29 @@
 mod bridge;
 mod commands;
 mod dto;
+mod edit;
+mod editor;
 mod error;
 mod events;
 mod state;
 
+use commands::editor::{
+    detect_editors, edit_confirm_upload, edit_remote_file, edit_resolve_conflict, open_local_file,
+};
 use commands::hosts::{delete_host, list_hosts, refresh_metrics, reload_hosts, save_host};
-use commands::keysetup::start_key_setup;
+use commands::keysetup::{
+    get_default_key, host_auth, inspect_ssh_key, list_ssh_keys, set_default_key, start_key_setup,
+};
 use commands::sftp::{
-    list_local_dir, preview_local_file, sftp_close, sftp_delete, sftp_download, sftp_list,
-    sftp_mkdir, sftp_open, sftp_preview, sftp_rename, sftp_upload,
+    list_local_dir, preview_local_file, sftp_close, sftp_delete, sftp_list, sftp_mkdir, sftp_open,
+    sftp_preview, sftp_rename,
 };
 use commands::snippets::{delete_snippet, execute_snippet, list_snippets, save_snippet};
 use commands::terminal::{terminal_close, terminal_open, terminal_resize, terminal_write};
+use commands::transfer::{
+    set_transfer_streams, transfer_cancel, transfer_commit, transfer_discard, transfer_forget,
+    transfer_prepare, transfer_retry,
+};
 use commands::update::{check_update, install_update, load_update_config, save_update_config};
 use omnyssh_core::event::{CoreEvent, SessionId};
 use omnyssh_core::ssh::pty::PtyManager;
@@ -99,8 +110,6 @@ fn specta_builder() -> Builder<tauri::Wry> {
             terminal_close,
             sftp_open,
             sftp_list,
-            sftp_upload,
-            sftp_download,
             sftp_mkdir,
             sftp_rename,
             sftp_delete,
@@ -108,7 +117,24 @@ fn specta_builder() -> Builder<tauri::Wry> {
             sftp_close,
             list_local_dir,
             preview_local_file,
+            transfer_prepare,
+            transfer_commit,
+            transfer_discard,
+            transfer_cancel,
+            transfer_retry,
+            transfer_forget,
+            set_transfer_streams,
+            detect_editors,
+            open_local_file,
+            edit_remote_file,
+            edit_resolve_conflict,
+            edit_confirm_upload,
             start_key_setup,
+            list_ssh_keys,
+            inspect_ssh_key,
+            get_default_key,
+            set_default_key,
+            host_auth,
             refresh_metrics,
             check_update,
             install_update,
@@ -128,7 +154,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             events::SftpOpDone,
             events::SftpDisconnected,
             events::FilePreview,
-            events::TransferProgress,
+            events::TransfersUpdated,
+            events::EditSync,
             events::KeySetupProgress,
             events::KeySetupComplete,
             events::KeySetupFailed,
@@ -215,6 +242,8 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Opens the support dialog's GitHub/Telegram links in the default browser.
         .plugin(tauri_plugin_opener::init())
+        // Native "open file" picker for choosing an editor app (Settings → Files).
+        .plugin(tauri_plugin_dialog::init())
         // Restores the window's size and position between launches; the flags keep it
         // away from everything that would touch the window itself (WINDOW_STATE_FLAGS).
         .plugin(
@@ -293,6 +322,13 @@ fn main() {
                 gui_state.set_hosts(hosts);
             }
             app.manage(gui_state);
+
+            // Local copies of remotely edited files belong to the tab that opened
+            // them; any left from an earlier run are stale.
+            let edit_cache = edit::cache_root(app.handle());
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(edit_cache);
+            });
 
             // Spawn the forwarders after `manage` so both can reach `GuiState` via
             // `app.state()` (the bridge maps PtyExited; the tap routes raw bytes).

@@ -116,7 +116,7 @@ test('host-first: spawn a terminal from a card, run a command, see output, then 
   await expect(page.locator('.xterm-rows')).toContainText('RESULT-OK');
 
   // Closing the tab tears the terminal down.
-  await page.getByRole('button', { name: 'Close web-1 · terminal' }).click();
+  await page.getByRole('button', { name: 'Close web-1', exact: true }).click();
   await expect(page.locator('.xterm')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'web-1 · terminal', exact: true })).toHaveCount(0);
 });

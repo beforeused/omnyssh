@@ -2,6 +2,7 @@
   // Run dialog (tech-gui.md §2.2): collect any declared param values, pick one or
   // more hosts to run on (broadcast), then execute. Host references show their live
   // status dot via the shared server-state palette. Semantic tokens only.
+  import { t } from '$lib/i18n';
   import { get } from 'svelte/store';
   import type { SnippetDto } from '$lib/bindings';
   import { Button, StatusDot, Icon } from '$lib/theme';
@@ -61,16 +62,16 @@
     'focus-visible:ring-2 focus-visible:ring-focus placeholder:text-faint';
 </script>
 
-<Modal label="Run snippet" onClose={onCancel}>
+<Modal label={$t('snip.runTitle')} onClose={onCancel}>
   <header class="border-b border-default px-5 py-3.5">
-    <h2 class="truncate text-sm font-semibold">Run “{snippet.name}”</h2>
+    <h2 class="truncate text-sm font-semibold">{$t('snip.runHeading', { name: snippet.name })}</h2>
     <p class="mt-0.5 truncate font-mono text-xs text-faint">{snippet.command}</p>
   </header>
 
   <div class="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
     {#if params.length}
       <div class="space-y-3">
-        <h3 class="text-[11px] font-medium uppercase tracking-[0.18em] text-faint">Parameters</h3>
+        <h3 class="text-[11px] font-medium uppercase tracking-[0.18em] text-faint">{$t('snip.parameters')}</h3>
         <!-- Keyed by position: params come from snippets.toml unchanged and the core
              never dedups them, so a name key could throw each_key_duplicate. -->
         {#each params as name, i (i)}
@@ -84,10 +85,10 @@
 
     <div class="space-y-2">
       <h3 class="text-[11px] font-medium uppercase tracking-[0.18em] text-faint">
-        Run on {selected.size} of {$hosts.length}
+        {$t('snip.runOn', { selected: selected.size, total: $hosts.length })}
       </h3>
       {#if $hosts.length === 0}
-        <p class="text-sm text-muted">No hosts configured.</p>
+        <p class="text-sm text-muted">{$t('snip.noHosts')}</p>
       {:else}
         <ul class="space-y-1">
           {#each $hosts as host (host.name)}
@@ -120,9 +121,9 @@
   </div>
 
   <footer class="flex justify-end gap-2 border-t border-default px-5 py-3">
-    <Button variant="ghost" onclick={onCancel}>Cancel</Button>
+    <Button variant="ghost" onclick={onCancel}>{$t('common.cancel')}</Button>
     <Button variant="primary" onclick={run} disabled={selected.size === 0}>
-      Run on {selected.size} {selected.size === 1 ? 'host' : 'hosts'}
+      {$t('snip.runOnN', { count: selected.size })}
     </Button>
   </footer>
 </Modal>

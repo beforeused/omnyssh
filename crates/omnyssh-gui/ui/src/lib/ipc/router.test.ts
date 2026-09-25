@@ -177,14 +177,14 @@ describe('ipc event router', () => {
     beginKeySetup('web-1');
     applyKeySetupProgress({
       hostName: 'web-1',
-      step: { index: 3, total: 6, description: 'Verifying key authentication' }
+      step: { id: 'verifyKeyAuth', index: 3, total: 6, description: 'Verifying key authentication' }
     });
     expect(get(keySetup)).toEqual({
       hostName: 'web-1',
-      phase: { kind: 'running', step: { index: 3, total: 6, description: 'Verifying key authentication' } }
+      phase: { kind: 'running', step: { id: 'verifyKeyAuth', index: 3, total: 6, description: 'Verifying key authentication' } }
     });
 
-    applyKeySetupComplete({ hostName: 'web-1', keyPath: '/k/id_ed25519' });
+    applyKeySetupComplete({ hostName: 'web-1', keyPath: '/k/id_ed25519', partial: false });
     expect(get(keySetup)).toEqual({
       hostName: 'web-1',
       phase: { kind: 'complete', keyPath: '/k/id_ed25519' }

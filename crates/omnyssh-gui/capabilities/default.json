@@ -8,12 +8,15 @@
     "core:window:allow-set-theme",
     "core:window:allow-start-dragging",
     "store:default",
+    "dialog:allow-open",
+    "dialog:allow-ask",
     {
       "identifier": "opener:allow-open-url",
       "allow": [
         { "url": "https://github.com/timhartmann7/omnyssh" },
         { "url": "https://github.com/timhartmann7/omnyssh/releases/*" },
-        { "url": "https://t.me/timhartmanndev" }
+        { "url": "https://t.me/timhartmanndev" },
+        { "url": "https://t.me/beforeused" }
       ]
     }
   ]

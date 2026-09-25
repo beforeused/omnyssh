@@ -26,4 +26,8 @@ export type IconName =
   | 'shield'
   | 'settings'
   | 'telegram'
-  | 'star';
+  | 'star'
+  | 'eye'
+  | 'external'
+  | 'chevron-up'
+  | 'chevron-down';

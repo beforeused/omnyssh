@@ -6,7 +6,14 @@
   import { theme } from '$lib/stores/theme';
   import { sidebarCollapsed } from '$lib/stores/ui';
   import { streamerMode } from '$lib/stores/streamer';
-  import { refreshInterval, driveMetricsRefresh } from '$lib/stores/settings';
+  import {
+    refreshInterval,
+    driveMetricsRefresh,
+    editor,
+    transferStreams
+  } from '$lib/stores/settings';
+  import { setTransferStreams } from '$lib/ipc/commands';
+  import { locale } from '$lib/i18n';
   import { lastError } from '$lib/stores/notifications';
 
   let { children } = $props();
@@ -20,6 +27,15 @@
     void sidebarCollapsed.hydrate();
     void streamerMode.hydrate();
     void refreshInterval.hydrate();
+    void editor.hydrate();
+    void locale.hydrate();
+    // Screen readers and hyphenation follow the UI language.
+    const stopLang = locale.subscribe((l) => document.documentElement.setAttribute('lang', l));
+    void transferStreams.hydrate();
+    // Keep the backend's per-host connection count in step with the setting.
+    const stopStreams = transferStreams.subscribe((n) => {
+      void setTransferStreams(n).catch(() => {});
+    });
     // Force a metric refresh on the user's interval; re-arms when the interval changes.
     const stopRefresh = driveMetricsRefresh(() => {
       void refreshMetrics().catch(() => {});
@@ -38,6 +54,8 @@
       disposed = true;
       stop?.();
       stopRefresh();
+      stopStreams();
+      stopLang();
     };
   });
 </script>

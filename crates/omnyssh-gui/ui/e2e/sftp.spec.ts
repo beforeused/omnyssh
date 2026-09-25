@@ -20,9 +20,15 @@ async function boot(page: Page): Promise<void> {
       const listeners: Record<string, number[]> = {};
       let nextSession = 0;
       let nextTransfer = 0;
-      // A pending transfer holds until the test fires its op-done, so the progress bar
-      // is observable mid-flight (the core is sequential — one transfer at a time).
+      // A transfer holds at a progress tick until the test completes it, so the queue
+      // panel is observable mid-flight.
       const completions: Array<() => void> = [];
+      let nextBatch = 0;
+      const batches: Record<number, { direction: 'upload' | 'download'; sources: string[]; destDir: string }> = {};
+      const transfersLog: Array<{ id: number; direction: string; name: string }> = [];
+      const opened: Array<{ cmd: string; path: string }> = [];
+      (win as { __opened?: unknown }).__opened = opened;
+      (win as { __fire?: unknown }).__fire = (event: string, payload: unknown) => fireEvent(event, payload);
 
       type Entry = { name: string; path: string; size: number; isDir: boolean };
       const local: Record<string, Entry[]> = {
@@ -63,7 +69,7 @@ async function boot(page: Page): Promise<void> {
         }
       }
 
-      // Fire the oldest still-pending transfer's op-done (deterministic completion).
+      // Finish the oldest still-running transfer (deterministic completion).
       (win as { __completeTransfer?: () => void }).__completeTransfer = () => completions.shift()?.();
 
       (win as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
@@ -91,26 +97,89 @@ async function boot(page: Page): Promise<void> {
               );
               return Promise.resolve(null);
             }
-            case 'sftp_upload': {
-              const { sessionId, remote: dest } = args as { sessionId: number; remote: string };
-              const tid = ++nextTransfer;
-              setTimeout(() => fireEvent('transfer-progress', { sessionId, transferId: tid, done: 4, total: 8 }), 0);
-              completions.push(() => {
-                addFile(remote, parentOf(dest), baseName(dest));
-                fireEvent('sftp-op-done', { sessionId, ok: true });
-              });
-              return Promise.resolve(null);
+            case 'transfer_prepare': {
+              // Walk nothing (flat files only) and flag names that already exist.
+              const { direction, sources, destDir } = args as {
+                direction: 'upload' | 'download';
+                sources: string[];
+                destDir: string;
+              };
+              const target = direction === 'upload' ? remote : local;
+              const batchId = ++nextBatch;
+              batches[batchId] = { direction, sources, destDir };
+              const conflicts = sources
+                .map((src, index) => ({ src, index }))
+                .filter(({ src }) => (target[destDir] ?? []).some((e) => e.name === baseName(src)))
+                .map(({ src, index }) => {
+                  const name = baseName(src);
+                  const dot = name.lastIndexOf('.');
+                  const altName = dot > 0 ? `${name.slice(0, dot)} (1)${name.slice(dot)}` : `${name} (1)`;
+                  return {
+                    index,
+                    name,
+                    destination: destDir === '/' ? `/${name}` : `${destDir}/${name}`,
+                    sourceSize: 8,
+                    existingSize: 8,
+                    existingIsDir: false,
+                    altName
+                  };
+                });
+              return Promise.resolve({ batchId, files: sources.length, bytes: sources.length * 8, conflicts });
             }
-            case 'sftp_download': {
-              const { sessionId, local: dest } = args as { sessionId: number; local: string };
-              const tid = ++nextTransfer;
-              setTimeout(() => fireEvent('transfer-progress', { sessionId, transferId: tid, done: 2, total: 8 }), 0);
-              completions.push(() => {
-                addFile(local, parentOf(dest), baseName(dest));
-                fireEvent('sftp-op-done', { sessionId, ok: true });
+            case 'transfer_commit': {
+              const { sessionId, batchId, resolutions } = args as {
+                sessionId: number;
+                batchId: number;
+                resolutions: Array<{ index: number; action: string }>;
+              };
+              const batch = batches[batchId];
+              const target = batch.direction === 'upload' ? remote : local;
+              const items = batch.sources.flatMap((src, index) => {
+                let name = baseName(src);
+                const exists = (target[batch.destDir] ?? []).some((e) => e.name === name);
+                if (exists) {
+                  const answer = resolutions.find((r) => r.index === index)?.action ?? 'skip';
+                  if (answer === 'skip') return [];
+                  if (answer === 'keepBoth') {
+                    const dot = name.lastIndexOf('.');
+                    name = dot > 0 ? `${name.slice(0, dot)} (1)${name.slice(dot)}` : `${name} (1)`;
+                  }
+                }
+                const dest = batch.destDir === '/' ? `/${name}` : `${batch.destDir}/${name}`;
+                const id = ++nextTransfer;
+                transfersLog.push({ id, direction: batch.direction, name });
+                // Like the engine's reporter, never report progress after completion.
+                let finished = false;
+                setTimeout(() => {
+                  if (!finished) {
+                    fireEvent('transfers-updated', { sessionId, updates: [{ id, state: 'running', done: 4, total: 8 }] });
+                  }
+                }, 0);
+                completions.push(() => {
+                  finished = true;
+                  addFile(target, batch.destDir, name);
+                  fireEvent('transfers-updated', { sessionId, updates: [{ id, state: 'done', done: 8, total: 8 }] });
+                });
+                return [
+                  {
+                    id,
+                    direction: batch.direction,
+                    name,
+                    local: batch.direction === 'upload' ? src : dest,
+                    remote: batch.direction === 'upload' ? dest : src,
+                    size: 8
+                  }
+                ];
               });
-              return Promise.resolve(null);
+              return Promise.resolve(items);
             }
+            case 'edit_confirm_upload':
+              opened.push({ cmd, path: `${args.remotePath}:${args.upload}` });
+              return Promise.resolve(null);
+            case 'open_local_file':
+            case 'edit_remote_file':
+              opened.push({ cmd, path: (args.path ?? args.remotePath) as string });
+              return Promise.resolve(null);
             case 'sftp_close':
               return Promise.resolve(null);
             case 'plugin:event|listen': {
@@ -154,6 +223,10 @@ test('host-first: a card’s files opens SFTP and browses both sides', async ({ 
   await expect(remotePane.getByText('config.yml')).toBeVisible();
 });
 
+function completeTransfer(page: Page): Promise<void> {
+  return page.evaluate(() => (window as unknown as { __completeTransfer: () => void }).__completeTransfer());
+}
+
 test('round-trip: upload a local file to the remote, then download a remote file', async ({
   page
 }) => {
@@ -162,25 +235,104 @@ test('round-trip: upload a local file to the remote, then download a remote file
 
   const localPane = page.getByRole('region', { name: 'Local' });
   const remotePane = page.getByRole('region', { name: 'web-1' });
+  const queue = page.getByRole('region', { name: 'Transfers' });
   await expect(localPane.getByText('notes.txt')).toBeVisible();
   await expect(remotePane.getByText('config.yml')).toBeVisible();
 
-  // Upload: mark the local file, click Upload — the live progress bar shows mid-flight.
+  // Upload: select the local file, click Upload — it joins the background queue.
   await localPane.getByRole('checkbox', { name: 'Mark notes.txt' }).click();
   await page.getByRole('button', { name: 'Upload' }).click();
-  await expect(page.getByLabel('transfer progress')).toBeVisible();
+  await expect(queue.getByText('1 transfer in progress')).toBeVisible();
 
-  // Complete it: op-done drains the batch, the remote pane re-lists with the new file.
-  await page.evaluate(() => (window as unknown as { __completeTransfer: () => void }).__completeTransfer());
+  // The panes stay usable while it runs: browse into a remote folder and back.
+  await remotePane.getByRole('option', { name: 'var' }).dblclick();
+  await expect(remotePane.getByText('/var')).toBeVisible();
+  await remotePane.getByRole('option', { name: '..' }).click();
+  await expect(remotePane.getByText('config.yml')).toBeVisible();
+
+  // Complete it: the remote pane showing the destination re-lists with the new file.
+  await completeTransfer(page);
+  await expect(queue.getByText('All transfers finished')).toBeVisible();
   await expect(remotePane.getByText('notes.txt')).toBeVisible();
-  await expect(page.getByLabel('transfer progress')).toHaveCount(0);
 
-  // Download: mark a remote file, click Download, complete — the local pane re-lists it.
+  // Download: select a remote file, click Download, complete — the local pane re-lists it.
   await remotePane.getByRole('checkbox', { name: 'Mark config.yml' }).click();
   await page.getByRole('button', { name: 'Download' }).click();
-  await expect(page.getByLabel('transfer progress')).toBeVisible();
-  await page.evaluate(() => (window as unknown as { __completeTransfer: () => void }).__completeTransfer());
+  await expect(queue.getByText('1 transfer in progress')).toBeVisible();
+  await completeTransfer(page);
   await expect(localPane.getByText('config.yml')).toBeVisible();
+
+  // Clearing the finished transfers hides the queue.
+  await queue.getByRole('button', { name: 'Clear' }).click();
+  await expect(queue).toHaveCount(0);
+});
+
+test('a name conflict asks first; “keep both” saves under a numbered name', async ({ page }) => {
+  await boot(page);
+  await page.getByTitle('files on web-1').click();
+  const localPane = page.getByRole('region', { name: 'Local' });
+  const remotePane = page.getByRole('region', { name: 'web-1' });
+
+  // Put notes.txt on the server first.
+  await localPane.getByRole('checkbox', { name: 'Mark notes.txt' }).click();
+  await page.getByRole('button', { name: 'Upload' }).click();
+  await completeTransfer(page);
+  await expect(remotePane.getByText('notes.txt')).toBeVisible();
+
+  // Upload it again: the conflict dialog asks.
+  await page.getByRole('button', { name: 'Upload' }).click();
+  const dialog = page.getByRole('dialog', { name: 'File already exists' });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: 'Keep both' }).click();
+  await expect(dialog).toHaveCount(0);
+  await completeTransfer(page);
+  await expect(remotePane.getByText('notes (1).txt')).toBeVisible();
+
+  // Cancel backs out of the whole batch: nothing is queued.
+  await page.getByRole('button', { name: 'Upload' }).click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(page.getByRole('region', { name: 'Transfers' }).getByText('in progress')).toHaveCount(0);
+});
+
+test('dragging a remote file onto the local pane downloads it', async ({ page }) => {
+  await boot(page);
+  await page.getByTitle('files on web-1').click();
+  const localPane = page.getByRole('region', { name: 'Local' });
+  const remotePane = page.getByRole('region', { name: 'web-1' });
+  const source = remotePane.getByRole('option', { name: 'config.yml' });
+  await expect(source).toBeVisible();
+
+  const from = await source.boundingBox();
+  const to = await localPane.getByRole('listbox').boundingBox();
+  if (!from || !to) throw new Error('panes not laid out');
+  await page.mouse.move(from.x + 20, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(from.x + 60, from.y + 40, { steps: 4 });
+  await page.mouse.move(to.x + to.width / 2, to.y + to.height - 20, { steps: 8 });
+  // The drag ghost names the target: the local pane's current folder.
+  await expect(page.getByText('→ here')).toBeVisible();
+  await page.mouse.up();
+
+  await expect(page.getByRole('region', { name: 'Transfers' }).getByText('1 transfer in progress')).toBeVisible();
+  await completeTransfer(page);
+  await expect(localPane.getByText('config.yml')).toBeVisible();
+});
+
+test('double-clicking a file opens it in the editor', async ({ page }) => {
+  await boot(page);
+  await page.getByTitle('files on web-1').click();
+  const localPane = page.getByRole('region', { name: 'Local' });
+  const remotePane = page.getByRole('region', { name: 'web-1' });
+
+  await localPane.getByRole('option', { name: 'notes.txt' }).dblclick();
+  await remotePane.getByRole('option', { name: 'config.yml' }).dblclick();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { __opened: unknown[] }).__opened))
+    .toEqual([
+      { cmd: 'open_local_file', path: '/home/user/notes.txt' },
+      { cmd: 'edit_remote_file', path: '/config.yml' }
+    ]);
 });
 
 test('an inactive tab’s modal never overlays another entity (§2 exactly-one-active)', async ({
@@ -218,4 +370,46 @@ test('action-first: the SFTP spawner opens the host picker, then a live session'
 
   await expect(page.getByRole('button', { name: 'web-1 · sftp', exact: true })).toBeVisible();
   await expect(page.getByRole('region', { name: 'web-1' }).getByText('config.yml')).toBeVisible();
+});
+
+test('saving an edited server file asks before uploading it', async ({ page }) => {
+  await boot(page);
+  await page.getByTitle('files on web-1').click();
+  await expect(page.getByRole('region', { name: 'web-1' }).getByText('config.yml')).toBeVisible();
+
+  // The backend saw a settled save of the local copy.
+  await page.evaluate(() =>
+    (window as unknown as { __fire: (e: string, p: unknown) => void }).__fire('edit-sync', {
+      sessionId: 1,
+      remotePath: '/config.yml',
+      state: 'modified'
+    })
+  );
+  const ask = page.getByRole('dialog', { name: 'File was changed' });
+  await expect(ask).toBeVisible();
+  await expect(ask.getByText('“config.yml” was changed')).toBeVisible();
+  await ask.getByRole('button', { name: 'Upload', exact: true }).click();
+  await expect(ask).toHaveCount(0);
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { __opened: unknown[] }).__opened))
+    .toContainEqual({ cmd: 'edit_confirm_upload', path: '/config.yml:true' });
+});
+
+test('a terminal docks under the SFTP panes', async ({ page }) => {
+  await boot(page);
+  await page.getByTitle('files on web-1').click();
+  const remotePane = page.getByRole('region', { name: 'web-1' });
+  await expect(remotePane.getByText('config.yml')).toBeVisible();
+
+  await remotePane.getByRole('button', { name: 'Terminal' }).click();
+  const dock = page.getByRole('region', { name: 'Terminal' });
+  await expect(dock).toBeVisible();
+  await expect(dock.locator('.xterm')).toBeVisible();
+  // Hiding keeps the shell; the toolbar button brings it back.
+  await dock.getByRole('button', { name: 'Hide terminal' }).click();
+  await expect(dock).toBeHidden();
+  await page.keyboard.press('Control+Backquote');
+  await expect(dock).toBeVisible();
+  await dock.getByRole('button', { name: 'Close terminal' }).click();
+  await expect(page.getByRole('region', { name: 'Terminal' })).toHaveCount(0);
 });

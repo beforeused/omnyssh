@@ -1,7 +1,8 @@
 //! SFTP session commands (tech-gui.md §4.2). `sftp_open` awaits the core connect and
 //! spawns a per-session forwarder that stamps every `sftp-*` event with the tab's
 //! session id (§3.4); the remote ops are thin `SftpCommand` enqueues whose results
-//! arrive as events. Local filesystem listing/preview return directly — the GUI never
+//! arrive as events. Uploads and downloads go through the tab's transfer engine
+//! (`commands::transfer`) instead, so they never hold up browsing. Local filesystem listing/preview return directly — the GUI never
 //! emits `LocalDirListed` (§4.3).
 
 use tauri::{AppHandle, State};
@@ -12,6 +13,7 @@ use omnyssh_core::ssh::sftp::{
     list_local_dir as core_list_local_dir, preview_local_file as core_preview_local_file,
     SftpCommand, SftpManager,
 };
+use omnyssh_core::ssh::transfer::TransferEngine;
 
 use crate::bridge;
 use crate::dto::FileEntryDto;
@@ -19,8 +21,12 @@ use crate::error::CommandError;
 use crate::state::GuiState;
 
 /// A tab's dedicated core-event channel buffer. Comfortably absorbs the connect ack
-/// plus a burst of transfer-progress ticks before the forwarder drains them (§3.4).
+/// plus a burst of listings and op acks before the forwarder drains them (§3.4).
 const SFTP_EVENT_BUFFER: usize = 256;
+
+/// Batched transfer-progress buffer. The engine sends one batch per ~150 ms, so a
+/// handful of slots is plenty; a full buffer only delays its reporter.
+const TRANSFER_UPDATE_BUFFER: usize = 16;
 
 /// Open an SFTP session for `host_name` (tech-gui.md §4.2). Awaits the core connect,
 /// registers the manager under a fresh public id, and spawns the per-session
@@ -43,8 +49,20 @@ pub async fn sftp_open(
         .map_err(|e| CommandError {
             message: e.to_string(),
         })?;
-    let session_id = state.register_sftp(manager);
-    tauri::async_runtime::spawn(bridge::forward_sftp_events(app, session_id, rx));
+    // The tab's transfer engine plans over the browsing connection and moves data
+    // over its own lanes, connected on the first transfer.
+    let (updates_tx, updates_rx) = mpsc::channel(TRANSFER_UPDATE_BUFFER);
+    let engine = TransferEngine::new(
+        host,
+        manager.ssh_session(),
+        state.transfer_streams(),
+        updates_tx,
+    );
+    let session_id = state.register_sftp(manager, engine);
+    tauri::async_runtime::spawn(bridge::forward_sftp_events(app.clone(), session_id, rx));
+    tauri::async_runtime::spawn(bridge::forward_transfer_updates(
+        app, session_id, updates_rx,
+    ));
     Ok(session_id)
 }
 
@@ -57,50 +75,6 @@ pub fn sftp_list(
     path: String,
 ) -> Result<(), CommandError> {
     state.send_sftp(session_id, SftpCommand::ListDir(path));
-    Ok(())
-}
-
-/// Upload a local file to a remote path (tech-gui.md §4.2). Allocates a transfer id
-/// owned by this session so `transfer-progress` routes back to the tab (§3.4).
-#[tauri::command]
-#[specta::specta]
-pub fn sftp_upload(
-    state: State<'_, GuiState>,
-    session_id: u64,
-    local: String,
-    remote: String,
-) -> Result<(), CommandError> {
-    let transfer_id = state.next_transfer(session_id);
-    state.send_sftp(
-        session_id,
-        SftpCommand::Upload {
-            local,
-            remote,
-            transfer_id,
-        },
-    );
-    Ok(())
-}
-
-/// Download a remote file to a local path (tech-gui.md §4.2). See `sftp_upload` for
-/// the transfer-id routing; the core guards the local destination against `..` (§3.2).
-#[tauri::command]
-#[specta::specta]
-pub fn sftp_download(
-    state: State<'_, GuiState>,
-    session_id: u64,
-    local: String,
-    remote: String,
-) -> Result<(), CommandError> {
-    let transfer_id = state.next_transfer(session_id);
-    state.send_sftp(
-        session_id,
-        SftpCommand::Download {
-            remote,
-            local,
-            transfer_id,
-        },
-    );
     Ok(())
 }
 

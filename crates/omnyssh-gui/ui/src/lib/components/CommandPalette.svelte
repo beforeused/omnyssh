@@ -3,6 +3,7 @@
   // 1.3). Navigator: jump to an open session or open a host (default: a shell). Picker:
   // hand a chosen host back to its caller (the spawner buttons). Keyboard-first — type
   // to filter, ↑/↓ to move, ↵ to select, esc to dismiss. Glass/blur per the brandbook.
+  import { t } from '$lib/i18n';
   import { tick } from 'svelte';
   import { Icon, StatusDot } from '$lib/theme';
   import { palette, paletteItems, paletteSignature, nextIndex, hostStatusDot } from '$lib/stores/palette';
@@ -27,16 +28,16 @@
   const firstHost = $derived(items.findIndex((it) => it.kind === 'host'));
 
   const placeholder = $derived(
-    $palette.mode === 'pickHost' ? 'Pick a host…' : 'Search hosts and sessions…'
+    $palette.mode === 'pickHost' ? $t('palette.pickHost') : $t('palette.search')
   );
   const emptyMessage = $derived(
     $palette.mode === 'pickHost'
       ? query
-        ? 'No matching hosts.'
-        : 'No hosts configured.'
+        ? $t('palette.noMatchingHosts')
+        : $t('palette.noHosts')
       : query
-        ? 'No matches.'
-        : 'No hosts or sessions yet.'
+        ? $t('palette.noMatches')
+        : $t('palette.empty')
   );
 
   // Focus returns here when the overlay closes, so a keyboard user is not dropped to
@@ -146,12 +147,12 @@
     class="fixed inset-0 z-50 flex items-start justify-center px-4 pt-[14vh]"
     role="dialog"
     aria-modal="true"
-    aria-label={$palette.mode === 'pickHost' ? 'Pick a host' : 'Command palette'}
+    aria-label={$palette.mode === 'pickHost' ? $t('palette.pickHostLabel') : $t('palette.label')}
   >
     <button
       type="button"
       tabindex="-1"
-      aria-label="Dismiss"
+      aria-label={$t('palette.dismiss')}
       class="absolute inset-0 bg-overlay"
       onclick={() => palette.close()}
     ></button>
@@ -181,10 +182,10 @@
                unique, so a name key could throw each_key_duplicate. -->
           {#each items as item, i (i)}
             {#if $palette.mode === 'navigate' && i === firstSession}
-              <li class={sectionHead}>Sessions</li>
+              <li class={sectionHead}>{$t('palette.sessions')}</li>
             {/if}
             {#if $palette.mode === 'navigate' && i === firstHost}
-              <li class={sectionHead}>Hosts</li>
+              <li class={sectionHead}>{$t('palette.hosts')}</li>
             {/if}
             <li>
               <button
@@ -215,9 +216,9 @@
       <div
         class="flex items-center gap-4 border-t border-default px-4 py-2 font-mono text-[11px] text-faint"
       >
-        <span>↑↓ navigate</span>
-        <span>↵ select</span>
-        <span>esc close</span>
+        <span>{$t('palette.navigate')}</span>
+        <span>{$t('palette.select')}</span>
+        <span>{$t('palette.close')}</span>
       </div>
     </div>
   </div>

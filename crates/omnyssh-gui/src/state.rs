@@ -4,19 +4,21 @@
 //! the core's inner handles. The shared engine channel feeds the bridge.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use omnyssh_core::event::{CoreEvent, SessionId, TransferId};
+use omnyssh_core::event::{CoreEvent, SessionId};
 use omnyssh_core::ssh::client::Host;
 use omnyssh_core::ssh::pool::PollManager;
 use omnyssh_core::ssh::pty::PtyManager;
 use omnyssh_core::ssh::sftp::{SftpCommand, SftpManager};
+use omnyssh_core::ssh::transfer::{TransferEngine, DEFAULT_STREAMS, MAX_STREAMS};
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
 
 use crate::dto::{HostDto, TerminalBytes};
+use crate::edit::EditWatcher;
 
 /// Metric poll cadence. Mirrors the TUI's fixed interval; a configurable refresh
 /// interval lands with settings in Stage 4.3 (tech-gui.md §4.3).
@@ -81,10 +83,13 @@ pub struct GuiState {
     term_channels: Mutex<HashMap<SessionId, Channel<TerminalBytes>>>,
     /// One SFTP manager per tab, keyed by its public session id (§3.4).
     sftp: Mutex<HashMap<SessionId, SftpManager>>,
-    /// SFTP progress routing: GUI-allocated transfer id -> owning session (§3.4).
-    transfer_owner: Mutex<HashMap<TransferId, SessionId>>,
-    /// Monotonic source for GUI-allocated transfer ids (§3.4).
-    next_transfer_id: AtomicU64,
+    /// One transfer engine per SFTP tab, keyed like `sftp`. Its lanes connect on
+    /// the first transfer and disconnect when idle.
+    transfers: Mutex<HashMap<SessionId, Arc<TransferEngine>>>,
+    /// The live "parallel streams" setting, shared with every engine.
+    transfer_streams: Arc<AtomicUsize>,
+    /// Remote files open in an external editor, per SFTP tab.
+    edits: Mutex<HashMap<SessionId, Arc<EditWatcher>>>,
     /// One-shot latch so the startup update check fires once, on the frontend's first
     /// `reload_hosts` — i.e. only after its event bridge is listening (§3.4).
     update_check_started: AtomicBool,
@@ -106,8 +111,9 @@ impl GuiState {
             pty: Mutex::new(pty),
             term_channels: Mutex::new(HashMap::new()),
             sftp: Mutex::new(HashMap::new()),
-            transfer_owner: Mutex::new(HashMap::new()),
-            next_transfer_id: AtomicU64::new(0),
+            transfers: Mutex::new(HashMap::new()),
+            transfer_streams: Arc::new(AtomicUsize::new(DEFAULT_STREAMS)),
+            edits: Mutex::new(HashMap::new()),
             update_check_started: AtomicBool::new(false),
             key_setup: Mutex::new(None),
             sessions: Mutex::new(SessionRegistry::default()),
@@ -326,9 +332,10 @@ impl GuiState {
         public
     }
 
-    /// Store a freshly connected SFTP manager under a new public session id (§3.4).
-    /// The id comes from the shared registry so it never collides with a terminal id.
-    pub fn register_sftp(&self, manager: SftpManager) -> SessionId {
+    /// Store a freshly connected SFTP manager and its transfer engine under a new
+    /// public session id (§3.4). The id comes from the shared registry so it never
+    /// collides with a terminal id.
+    pub fn register_sftp(&self, manager: SftpManager, engine: TransferEngine) -> SessionId {
         let id = self
             .sessions
             .lock()
@@ -338,6 +345,10 @@ impl GuiState {
             .lock()
             .expect("sftp lock poisoned")
             .insert(id, manager);
+        self.transfers
+            .lock()
+            .expect("transfers lock poisoned")
+            .insert(id, Arc::new(engine));
         id
     }
 
@@ -354,28 +365,51 @@ impl GuiState {
         }
     }
 
-    /// Allocate a transfer id owned by `session_id`, so its `FileTransferProgress`
-    /// events route back to the right tab via `transfer_owner` (§3.4).
-    pub fn next_transfer(&self, session_id: SessionId) -> TransferId {
-        let id = self.next_transfer_id.fetch_add(1, Ordering::Relaxed) + 1;
-        self.transfer_owner
+    /// The transfer engine of a live SFTP tab.
+    pub fn transfer_engine(&self, session_id: SessionId) -> Option<Arc<TransferEngine>> {
+        self.transfers
             .lock()
-            .expect("transfer_owner lock poisoned")
-            .insert(id, session_id);
-        id
+            .expect("transfers lock poisoned")
+            .get(&session_id)
+            .cloned()
     }
 
-    /// The session that owns a transfer id, for progress routing (§3.4/§4.1).
-    pub fn transfer_session(&self, transfer_id: TransferId) -> Option<SessionId> {
-        self.transfer_owner
+    /// The shared "parallel streams" setting handed to each new engine.
+    pub fn transfer_streams(&self) -> Arc<AtomicUsize> {
+        self.transfer_streams.clone()
+    }
+
+    /// Update the "parallel streams" setting; lanes spawned from now on follow it.
+    pub fn set_transfer_streams(&self, streams: usize) {
+        self.transfer_streams
+            .store(streams.clamp(1, MAX_STREAMS), Ordering::Relaxed);
+    }
+
+    /// The editor-sync watcher of an SFTP tab, created on first use by `make`.
+    pub fn edit_watcher(
+        &self,
+        session_id: SessionId,
+        make: impl FnOnce() -> Arc<EditWatcher>,
+    ) -> Arc<EditWatcher> {
+        self.edits
             .lock()
-            .expect("transfer_owner lock poisoned")
-            .get(&transfer_id)
-            .copied()
+            .expect("edits lock poisoned")
+            .entry(session_id)
+            .or_insert_with(make)
+            .clone()
+    }
+
+    /// The editor-sync watcher of an SFTP tab, if one was ever started.
+    pub fn existing_edit_watcher(&self, session_id: SessionId) -> Option<Arc<EditWatcher>> {
+        self.edits
+            .lock()
+            .expect("edits lock poisoned")
+            .get(&session_id)
+            .cloned()
     }
 
     /// User-initiated SFTP close: drop the manager (a graceful `Disconnect` to its
-    /// task) and prune this session's transfer-owner entries (§3.4).
+    /// task), cancel the tab's transfers and stop syncing its edited files (§3.4).
     pub fn close_sftp(&self, session_id: SessionId) {
         if let Some(manager) = self
             .sftp
@@ -385,10 +419,22 @@ impl GuiState {
         {
             manager.disconnect();
         }
-        self.transfer_owner
+        if let Some(engine) = self
+            .transfers
             .lock()
-            .expect("transfer_owner lock poisoned")
-            .retain(|_, owner| *owner != session_id);
+            .expect("transfers lock poisoned")
+            .remove(&session_id)
+        {
+            engine.shutdown();
+        }
+        if let Some(watcher) = self
+            .edits
+            .lock()
+            .expect("edits lock poisoned")
+            .remove(&session_id)
+        {
+            watcher.stop();
+        }
     }
 }
 
@@ -469,29 +515,18 @@ mod tests {
     }
 
     #[test]
-    fn transfer_ids_are_unique_and_route_to_their_owning_session() {
+    fn transfer_streams_setting_is_clamped_and_shared() {
         let (engine_tx, _engine_rx) = mpsc::channel::<CoreEvent>(8);
         let state = GuiState::new(engine_tx, PtyManager::new());
-
-        // Two concurrent SFTP tabs (public ids 1 and 2) each issue transfers.
-        let (a, b) = (1, 2);
-        let t1 = state.next_transfer(a);
-        let t2 = state.next_transfer(b);
-        let t3 = state.next_transfer(a);
-        assert!(
-            t1 != t2 && t2 != t3 && t1 != t3,
-            "transfer ids must be unique"
-        );
-        assert_eq!(state.transfer_session(t1), Some(a));
-        assert_eq!(state.transfer_session(t2), Some(b));
-        assert_eq!(state.transfer_session(t3), Some(a));
-        assert_eq!(state.transfer_session(999), None);
-
-        // Closing one session prunes only its transfers; the other tab is untouched.
-        state.close_sftp(a);
-        assert_eq!(state.transfer_session(t1), None);
-        assert_eq!(state.transfer_session(t3), None);
-        assert_eq!(state.transfer_session(t2), Some(b));
+        let shared = state.transfer_streams();
+        assert_eq!(shared.load(Ordering::Relaxed), DEFAULT_STREAMS);
+        state.set_transfer_streams(0);
+        assert_eq!(shared.load(Ordering::Relaxed), 1);
+        state.set_transfer_streams(99);
+        assert_eq!(shared.load(Ordering::Relaxed), MAX_STREAMS);
+        // Closing an unknown session is a no-op.
+        state.close_sftp(42);
+        assert!(state.transfer_engine(42).is_none());
     }
 
     // A remote exit must prune the core PtyManager slot (the ended task never removes

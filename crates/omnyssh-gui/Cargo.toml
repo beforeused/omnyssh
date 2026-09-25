@@ -27,6 +27,8 @@ tokio = { workspace = true }
 # Timestamps the key-setup completion write onto the host, matching the TUI's
 # `key_setup_date` so both frontends round-trip the same shared hosts.toml (§4.2).
 chrono = { workspace = true }
+# Home directory for finding editors installed per-user (~/Applications, ~/.local/bin).
+dirs = { workspace = true }
 # tauri-specta v2 + specta v2 are release candidates (tech-gui.md §3.3): pin exact
 # rc versions. rc.21 is the last combo docs.rs builds; upgrades need re-verification.
 specta = { version = "=2.0.0-rc.22", features = ["derive", "function"] }
@@ -43,6 +45,9 @@ tauri-plugin-opener = "2"
 # Restores the window's size and position between launches. Registered Rust-side only,
 # so none of its commands are granted to the frontend.
 tauri-plugin-window-state = "2"
+# Native file picker for Settings → Files → "Choose app…". Only `allow-open` is
+# granted to the frontend.
+tauri-plugin-dialog = "2"
 # `generate_context!` embeds the `plugins.updater` config and expands to serde_json at
 # runtime; also asserts the wire form of DTOs in tests (e.g. HostDto never carries a password).
 serde_json = "1"

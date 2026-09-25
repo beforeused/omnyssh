@@ -38,6 +38,7 @@ async function boot(page: Page): Promise<void> {
               // Upsert by name as a manual host; the outbound view (HostDto) omits the
               // secret fields the input carried, mirroring the backend map (§3.4).
               const h = args.input as Record<string, unknown> & { name: string; identityFile?: string };
+              (win as { __lastSaved?: unknown }).__lastSaved = h;
               const view = {
                 name: h.name,
                 hostname: h.hostname,
@@ -53,6 +54,10 @@ async function boot(page: Page): Promise<void> {
               else state.hosts.push(view);
               return Promise.resolve(null);
             }
+            case 'list_ssh_keys':
+              return Promise.resolve([
+                { path: '/home/me/.ssh/id_ed25519', name: 'id_ed25519', kind: 'ed25519', encrypted: false }
+              ]);
             case 'delete_host':
               state.hosts = state.hosts.filter((x) => (x as { name: string }).name !== args.name);
               return Promise.resolve(null);
@@ -162,4 +167,22 @@ test('rejects a new host whose name already exists', async ({ page }) => {
   // The editor stays open with an inline error rather than clobbering the existing host.
   await expect(editor).toBeVisible();
   await expect(editor.getByText('A host named "web-1" already exists')).toBeVisible();
+});
+
+test('a new host picks a key found in ~/.ssh and needs no password', async ({ page }) => {
+  await boot(page);
+  await page.getByRole('button', { name: 'Add host' }).first().click();
+  const editor = page.getByRole('dialog', { name: 'Add host' });
+  await editor.getByLabel('Name', { exact: true }).fill('key-box');
+  await editor.getByLabel('Hostname / IP').fill('10.1.1.1');
+  // The key list comes from ~/.ssh; the folder button is there for keys elsewhere.
+  await expect(editor.getByRole('button', { name: 'Choose a key file…' })).toBeVisible();
+  await editor.getByRole('combobox').first().selectOption('/home/me/.ssh/id_ed25519');
+  await editor.getByRole('button', { name: 'Add host' }).click();
+  await expect(page.getByText('key-box', { exact: true })).toBeVisible();
+  const saved = await page.evaluate(
+    () => (window as unknown as { __lastSaved: Record<string, unknown> }).__lastSaved
+  );
+  expect(saved.identityFile).toBe('/home/me/.ssh/id_ed25519');
+  expect(saved.password).toBeUndefined();
 });

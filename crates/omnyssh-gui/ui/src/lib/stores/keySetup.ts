@@ -9,7 +9,7 @@ import type { KeySetupStepDto } from '$lib/bindings';
 /** The phase a run is in: streaming steps, or one of the three terminal outcomes. */
 export type KeySetupPhase =
   | { kind: 'running'; step: KeySetupStepDto | null }
-  | { kind: 'complete'; keyPath: string }
+  | { kind: 'complete'; keyPath: string; passwordAuthDisabled?: boolean; partial?: boolean }
   | { kind: 'failed'; error: string }
   | { kind: 'rolledBack'; result: string };
 
@@ -48,8 +48,16 @@ export function reduceProgress(
 /** A terminal outcome always shows for its host, even if the running panel was
  *  dismissed — so the result (and, for `complete`, the card refresh) is never missed.
  *  Pure. */
-export function reduceComplete(hostName: string, keyPath: string): KeySetupRun {
-  return { hostName, phase: { kind: 'complete', keyPath } };
+export function reduceComplete(
+  hostName: string,
+  keyPath: string,
+  passwordAuthDisabled?: boolean,
+  partial?: boolean
+): KeySetupRun {
+  const phase: KeySetupPhase = { kind: 'complete', keyPath };
+  if (passwordAuthDisabled !== undefined) phase.passwordAuthDisabled = passwordAuthDisabled;
+  if (partial) phase.partial = true;
+  return { hostName, phase };
 }
 
 export function reduceFailed(hostName: string, error: string): KeySetupRun {

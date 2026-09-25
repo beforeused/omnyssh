@@ -9,6 +9,9 @@ use crate::error::CommandError;
 use crate::events;
 use crate::state::GuiState;
 
+/// Whether the first `reload_hosts` asks the upstream release feed for updates.
+const CHECK_UPSTREAM_UPDATES: bool = false;
+
 /// Return the cached host list (populated at startup / on reload, tech-gui.md §4.2).
 #[tauri::command]
 #[specta::specta]
@@ -35,7 +38,9 @@ pub async fn reload_hosts(app: AppHandle, state: State<'_, GuiState>) -> Result<
     // after its event bridge is listening (so `update-available` isn't dropped, §3.4), and
     // doing it before the fallible load means a malformed config can't also suppress the
     // update banner for the session.
-    if state.claim_update_check() {
+    // This build is a fork: the upstream release feed would offer OmnySSH's own
+    // builds as "updates" and replace it, so the automatic check stays off.
+    if CHECK_UPSTREAM_UPDATES && state.claim_update_check() {
         tauri::async_runtime::spawn(crate::commands::update::startup_update_check(
             state.engine_sender(),
         ));
@@ -97,6 +102,7 @@ fn upsert(hosts: &mut Vec<Host>, input: HostInputDto, imported: Option<Host>) {
     // An omitted monitoring mode means "unchanged", not "back to SSH" — losing it
     // would silently start logging in to a device chosen for reachability only.
     let monitoring_given = input.monitoring.is_some();
+    let clear_identity = input.clear_identity.unwrap_or(false);
     let mut host = Host::from(input);
     match hosts.iter().position(|h| h.name == host.name) {
         Some(i) => {
@@ -106,9 +112,11 @@ fn upsert(hosts: &mut Vec<Host>, input: HostInputDto, imported: Option<Host>) {
                 host.monitor_port = existing.monitor_port;
             }
             host.password = host.password.or_else(|| existing.password.clone());
-            host.identity_file = host
-                .identity_file
-                .or_else(|| existing.identity_file.clone());
+            if !clear_identity {
+                host.identity_file = host
+                    .identity_file
+                    .or_else(|| existing.identity_file.clone());
+            }
             host.proxy_jump = host.proxy_jump.or_else(|| existing.proxy_jump.clone());
             host.key_setup_date = existing.key_setup_date.clone();
             host.password_auth_disabled = existing.password_auth_disabled;
@@ -122,7 +130,9 @@ fn upsert(hosts: &mut Vec<Host>, input: HostInputDto, imported: Option<Host>) {
             // address direct, which is exactly the hazard fixed in 1.1.1.
             if let Some(imported) = imported {
                 host.proxy_jump = host.proxy_jump.or(imported.proxy_jump);
-                host.identity_file = host.identity_file.or(imported.identity_file);
+                if !clear_identity {
+                    host.identity_file = host.identity_file.or(imported.identity_file);
+                }
                 // Which `~/.ssh/config` entry this copy stands in for. Inert while the
                 // names match — `merge_hosts` already drops the import on the name — but
                 // it is what keeps the import hidden once the copy is renamed in the TUI,
@@ -174,6 +184,7 @@ mod tests {
             identity_file: None,
             password: None,
             proxy_jump: None,
+            clear_identity: None,
             tags: vec![],
             notes: None,
             monitoring: None,
@@ -363,5 +374,43 @@ mod tests {
         remove(&mut hosts, "ghost");
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].name, "a");
+    }
+}
+
+#[cfg(test)]
+mod clear_identity_tests {
+    use super::*;
+
+    #[test]
+    fn clearing_the_identity_drops_the_stored_key() {
+        let mut hosts = vec![Host {
+            name: "web".to_string(),
+            identity_file: Some("/k".to_string()),
+            source: HostSource::Manual,
+            ..Host::default()
+        }];
+        let mut input = HostInputDto {
+            name: "web".to_string(),
+            hostname: "h".to_string(),
+            user: "root".to_string(),
+            port: 22,
+            identity_file: None,
+            password: None,
+            proxy_jump: None,
+            clear_identity: None,
+            tags: vec![],
+            notes: None,
+            monitoring: None,
+            monitor_port: None,
+        };
+        upsert(&mut hosts, input.clone(), None);
+        assert_eq!(
+            hosts[0].identity_file.as_deref(),
+            Some("/k"),
+            "absent keeps it"
+        );
+        input.clear_identity = Some(true);
+        upsert(&mut hosts, input, None);
+        assert_eq!(hosts[0].identity_file, None);
     }
 }

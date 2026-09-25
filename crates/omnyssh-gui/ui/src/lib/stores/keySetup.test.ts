@@ -13,7 +13,7 @@ import {
 } from './keySetup';
 
 function step(index: number, description = 'Working'): KeySetupStepDto {
-  return { index, total: 6, description };
+  return { id: 'step', index, total: 6, description };
 }
 
 describe('key-setup run lifecycle', () => {

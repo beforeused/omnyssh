@@ -180,30 +180,6 @@ async sftpList(sessionId: number, path: string) : Promise<Result<null, CommandEr
 }
 },
 /**
- * Upload a local file to a remote path (tech-gui.md §4.2). Allocates a transfer id
- * owned by this session so `transfer-progress` routes back to the tab (§3.4).
- */
-async sftpUpload(sessionId: number, local: string, remote: string) : Promise<Result<null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("sftp_upload", { sessionId, local, remote }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Download a remote file to a local path (tech-gui.md §4.2). See `sftp_upload` for
- * the transfer-id routing; the core guards the local destination against `..` (§3.2).
- */
-async sftpDownload(sessionId: number, local: string, remote: string) : Promise<Result<null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("sftp_download", { sessionId, local, remote }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
  * Create a remote directory (tech-gui.md §4.2); completion arrives as `sftp-op-done`.
  */
 async sftpMkdir(sessionId: number, path: string) : Promise<Result<null, CommandError>> {
@@ -283,15 +259,208 @@ async previewLocalFile(path: string) : Promise<Result<string, CommandError>> {
 }
 },
 /**
- * Start auto key-setup for `host_name` (tech-gui.md §4.2). Fire-and-forget: the flow
- * runs on a background task and reports via `key-setup-*` events, mirroring the core's
- * own model. Resolving the full host record (secrets included) stays backend-side
- * (§3.4). One run at a time: an unknown host or a run already in flight is the
- * synchronous error, so two runs never race a `hosts.toml` write.
+ * Expand `sources` (local paths for an upload, remote paths for a download)
+ * into a batch targeting `dest_dir`, listing every destination that already
+ * exists. The batch waits for `transfer_commit` or `transfer_discard`.
  */
-async startKeySetup(hostName: string) : Promise<Result<null, CommandError>> {
+async transferPrepare(sessionId: number, direction: TransferDirectionDto, sources: string[], destDir: string) : Promise<Result<PreparedBatchDto, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_key_setup", { hostName }) };
+    return { status: "ok", data: await TAURI_INVOKE("transfer_prepare", { sessionId, direction, sources, destDir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Enqueue a prepared batch. Conflicts without an answer are skipped. Returns
+ * the enqueued transfers so the queue panel can list them straight away.
+ */
+async transferCommit(sessionId: number, batchId: number, resolutions: ConflictResolutionDto[]) : Promise<Result<TransferItemDto[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("transfer_commit", { sessionId, batchId, resolutions }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Drop a prepared batch the user backed out of.
+ */
+async transferDiscard(sessionId: number, batchId: number) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("transfer_discard", { sessionId, batchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel queued or running transfers; running ones clean up after themselves.
+ */
+async transferCancel(sessionId: number, ids: number[]) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("transfer_cancel", { sessionId, ids }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Re-run failed or cancelled transfers.
+ */
+async transferRetry(sessionId: number, ids: number[]) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("transfer_retry", { sessionId, ids }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Forget finished transfers the user cleared from the queue panel.
+ */
+async transferForget(sessionId: number, ids: number[]) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("transfer_forget", { sessionId, ids }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Set how many parallel connections each host's transfers may use (1–8).
+ * Applies to connections opened from now on.
+ */
+async setTransferStreams(streams: number) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_transfer_streams", { streams }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Editors found installed on this machine, for the Settings picker.
+ */
+async detectEditors() : Promise<Result<EditorAppDto[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("detect_editors") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open a local file in `editor`.
+ */
+async openLocalFile(path: string, editor: EditorDto) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_local_file", { path, editor }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Download a remote file, open it in `editor`, and upload every save back.
+ * Resolves once the editor was launched; sync progress arrives as `edit-sync`.
+ */
+async editRemoteFile(sessionId: number, remotePath: string, editor: EditorDto) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("edit_remote_file", { sessionId, remotePath, editor }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Answer an `edit-sync` conflict: `overwrite` pushes the local copy over the
+ * server's; otherwise the local copy is replaced with the server's version.
+ */
+async editResolveConflict(sessionId: number, remotePath: string, overwrite: boolean) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("edit_resolve_conflict", { sessionId, remotePath, overwrite }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Answer an `edit-sync` `modified` prompt: upload this save, or keep it local.
+ */
+async editConfirmUpload(sessionId: number, remotePath: string, upload: boolean) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("edit_confirm_upload", { sessionId, remotePath, upload }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Install a key on `host_name` (tech-gui.md §4.2): a new one or `key`, with
+ * logins afterwards per `mode`. Fire-and-forget; reports via `key-setup-*` events.
+ * One run at a time, so two runs never race a `hosts.toml` write.
+ */
+async startKeySetup(hostName: string, key: KeyChoiceDto, mode: AuthModeDto) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_key_setup", { hostName, key, mode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The private keys in `~/.ssh`, for the key pickers.
+ */
+async listSshKeys() : Promise<Result<SshKeyDto[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_ssh_keys") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Describe a key file the user picked by hand. Errors when it is not a private key.
+ */
+async inspectSshKey(path: string) : Promise<Result<SshKeyDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("inspect_ssh_key", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The app-wide default key (used by hosts that name none), if set.
+ */
+async getDefaultKey() : Promise<Result<string | null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_default_key") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Set (or clear, with `None`) the app-wide default key. Takes effect for new
+ * connections straight away.
+ */
+async setDefaultKey(path: string | null) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_default_key", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Which key a host uses and whether it has a stored password — for the host form
+ * and the key dialog. Never the password or key material.
+ */
+async hostAuth(hostName: string) : Promise<Result<HostAuthDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("host_auth", { hostName }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -364,6 +533,7 @@ async saveUpdateConfig(config: UpdateConfigDto) : Promise<Result<null, CommandEr
 
 
 export const events = __makeEvents__<{
+editSync: EditSync,
 error: Error,
 filePreview: FilePreview,
 hostStatusChanged: HostStatusChanged,
@@ -381,9 +551,10 @@ sftpDisconnected: SftpDisconnected,
 sftpOpDone: SftpOpDone,
 snippetResult: SnippetResult,
 terminalExited: TerminalExited,
-transferProgress: TransferProgress,
+transfersUpdated: TransfersUpdated,
 updateAvailable: UpdateAvailable
 }>({
+editSync: "edit-sync",
 error: "error",
 filePreview: "file-preview",
 hostStatusChanged: "host-status-changed",
@@ -401,7 +572,7 @@ sftpDisconnected: "sftp-disconnected",
 sftpOpDone: "sftp-op-done",
 snippetResult: "snippet-result",
 terminalExited: "terminal-exited",
-transferProgress: "transfer-progress",
+transfersUpdated: "transfers-updated",
 updateAvailable: "update-available"
 })
 
@@ -411,12 +582,64 @@ updateAvailable: "update-available"
 
 /** user-defined types **/
 
+/**
+ * How the server accepts logins after key setup.
+ */
+export type AuthModeDto = "keyAndPassword" | "keyOnly"
 export type CommandError = { message: string }
+/**
+ * How the user resolved one conflict.
+ */
+export type ConflictActionDto = "replace" | "skip" | "keepBoth"
+export type ConflictResolutionDto = { index: number; action: ConflictActionDto }
 /**
  * Live connection state for a host (tech-gui.md §4.1). Internally tagged so the
  * frontend consumes a discriminated union keyed on `kind`.
  */
 export type ConnectionStatusDto = { kind: "unknown" } | { kind: "connecting" } | { kind: "connected" } | { kind: "failed"; message: string }
+/**
+ * A remote file open in an external editor was saved locally and is being (or
+ * was) pushed back, or needs the user because the server copy changed too.
+ */
+export type EditSync = { sessionId: number; remotePath: string; state: EditSyncStateDto; error?: string | null }
+export type EditSyncStateDto = 
+/**
+ * Saved locally; asking whether to upload the new version.
+ */
+"modified" | 
+/**
+ * Saved locally; uploading the new version.
+ */
+"uploading" | 
+/**
+ * The server has the saved version.
+ */
+"synced" | 
+/**
+ * The file changed on the server since it was opened — asks before overwriting.
+ */
+"conflict" | "failed"
+/**
+ * An editor found installed on this machine.
+ */
+export type EditorAppDto = { name: string; path: string }
+/**
+ * Which program opens files (Settings → Files). Internally tagged like
+ * `ConnectionStatusDto`.
+ */
+export type EditorDto = 
+/**
+ * The OS default app for the file type.
+ */
+{ kind: "system" } | 
+/**
+ * A specific application (a `.app` bundle on macOS, an executable elsewhere).
+ */
+{ kind: "app"; name: string; path: string } | 
+/**
+ * A command line; `{file}` is replaced by the path (appended when absent).
+ */
+{ kind: "command"; command: string }
 /**
  * A background error surfaced to the user.
  */
@@ -432,6 +655,13 @@ export type FileEntryDto = { name: string; path: string; size: number; isDir: bo
  */
 export type FilePreview = { sessionId: number; path: string; content: string }
 /**
+ * A host's stored credentials as far as the key dialog and the host form need
+ * them: which key file it uses (a path, never key material) and whether a
+ * password is stored (never the password itself). Fetched per host on demand,
+ * never broadcast with the host list.
+ */
+export type HostAuthDto = { identityFile?: string | null; hasPassword: boolean }
+/**
  * A host as the frontend sees it — password and private-key material omitted
  * (tech-gui.md §3.4). `hasKey` reports whether an identity file is configured;
  * the key path itself never crosses the boundary.
@@ -445,7 +675,12 @@ export type HostDto = { name: string; hostname: string; user: string; port: numb
  * travel back out: the outbound `HostDto` omits both (§3.4). Inbound only, so it
  * derives `Deserialize` (not `Serialize`).
  */
-export type HostInputDto = { name: string; hostname: string; user: string; port: number; identityFile?: string | null; password?: string | null; proxyJump?: string | null; tags: string[]; notes?: string | null; monitoring?: MonitorModeDto | null; monitorPort?: number | null }
+export type HostInputDto = { name: string; hostname: string; user: string; port: number; identityFile?: string | null; password?: string | null; proxyJump?: string | null; 
+/**
+ * Drop the stored identity file (the form's "default key / agent" choice).
+ * Without it, an absent `identityFile` keeps the stored one.
+ */
+clearIdentity?: boolean | null; tags: string[]; notes?: string | null; monitoring?: MonitorModeDto | null; monitorPort?: number | null }
 /**
  * Host origin, mirrors `omnyssh_core::ssh::client::HostSource`.
  */
@@ -460,10 +695,32 @@ export type HostStatusChanged = { hostName: string; status: ConnectionStatusDto 
  */
 export type HostsLoaded = HostDto[]
 /**
+ * Which key key-setup installs.
+ */
+export type KeyChoiceDto = 
+/**
+ * A new Ed25519 key in `~/.ssh`, named `name` (default
+ * `omnyssh_<host>_ed25519`; an existing pair of that name is reused).
+ */
+{ kind: "generate"; name?: string | null } | 
+/**
+ * An existing private key.
+ */
+{ kind: "existing"; path: string }
+/**
  * Key setup finished successfully — key auth is configured (tech-gui.md §4.3).
  * `keyPath` is the generated private-key path (a path, never key material, §3.4).
  */
-export type KeySetupComplete = { hostName: string; keyPath: string }
+export type KeySetupComplete = { hostName: string; keyPath: string; 
+/**
+ * Whether the server now refuses password logins, when known.
+ */
+passwordAuthDisabled?: boolean | null; 
+/**
+ * Key-only was asked for but the key could only be installed (no sudo to
+ * turn passwords off).
+ */
+partial: boolean }
 /**
  * Key setup failed before touching the server's auth config (tech-gui.md §4.3).
  * Password authentication is never disabled unless a key was verified first.
@@ -482,9 +739,10 @@ export type KeySetupRollback = { hostName: string; result: string }
 /**
  * One step of the auto key-setup flow, for the progress view (tech-gui.md §4.2/§4.3).
  * `index` is 1-based (`1..=total`); `description` is the core's human-readable label.
- * Maps from the core `KeySetupStep`.
+ * Maps from the core `KeySetupStep`. `id` names the step for the frontend's
+ * translations; `description` is the core's English text.
  */
-export type KeySetupStepDto = { index: number; total: number; description: string }
+export type KeySetupStepDto = { id: string; index: number; total: number; description: string }
 /**
  * A metrics snapshot for a host (tech-gui.md §4.1). The core's `Instant` is
  * flattened to `ageSeconds` (seconds since the sample) so it can serialise.
@@ -499,6 +757,10 @@ export type MetricsUpdated = { hostName: string; metrics: MetricsDto }
  * (tech-gui.md §4.1). `tcpPort` means reachability only — no login, no metrics.
  */
 export type MonitorModeDto = "ssh" | "tcpPort"
+/**
+ * An expanded transfer batch (folders walked) awaiting `transfer_commit`.
+ */
+export type PreparedBatchDto = { batchId: number; files: number; bytes: number; conflicts: TransferConflictDto[] }
 /**
  * A single process in the "top processes" panel (tech-gui.md §4.1).
  */
@@ -569,6 +831,14 @@ export type SnippetResult = { hostName: string; snippetName: string; ok: boolean
  */
 export type SnippetScopeDto = "global" | "host"
 /**
+ * A private key found in `~/.ssh` (or picked by hand), for the key pickers.
+ */
+export type SshKeyDto = { path: string; name: string; kind?: string | null; comment?: string | null; 
+/**
+ * Passphrase-protected: usable only through the SSH agent.
+ */
+encrypted: boolean }
+/**
  * Raw PTY output bytes for a terminal session's per-session `Channel` (tech-gui.md
  * §3.3/§3.6). Deliberately **not** `Serialize`: that dodges the blanket
  * `Serialize -> IpcResponse` mapping (which would JSON-encode to a slow `number[]`),
@@ -583,17 +853,33 @@ export type TerminalBytes = number[]
  */
 export type TerminalExited = { sessionId: number }
 /**
- * Live transfer progress (tech-gui.md §4.3). The payload is `TransferProgressDto`,
- * routed to its owning session via `transfer_owner` (§3.4/§4.1).
+ * A destination that already exists, awaiting the user's choice. `index` keys
+ * the answer back to the planned file; `altName` is the "keep both" name.
  */
-export type TransferProgress = TransferProgressDto
+export type TransferConflictDto = { index: number; 
 /**
- * Live progress for one SFTP upload/download (tech-gui.md §4.1). The GUI allocates
- * `transferId` when it issues the transfer and resolves its owning `sessionId` via
- * `transfer_owner` (§3.4); `done`/`total` are byte counts (`total` is `0` when the
- * remote size could not be determined).
+ * Path relative to the destination folder ("site/css/app.css").
  */
-export type TransferProgressDto = { sessionId: number; transferId: number; done: number; total: number }
+name: string; destination: string; sourceSize: number; existingSize: number; existingIsDir: boolean; altName: string }
+/**
+ * Which way a transfer moves bytes.
+ */
+export type TransferDirectionDto = "upload" | "download"
+/**
+ * One enqueued transfer, returned by `transfer_commit` so the queue panel can
+ * list it before its first progress update lands.
+ */
+export type TransferItemDto = { id: number; direction: TransferDirectionDto; name: string; local: string; remote: string; size: number }
+export type TransferStateDto = "queued" | "running" | "done" | "failed" | "cancelled"
+/**
+ * Batched progress/state for one transfer (the engine reports ~7×/s).
+ */
+export type TransferUpdateDto = { id: number; state: TransferStateDto; done: number; total: number; error?: string | null }
+/**
+ * Batched progress for one SFTP tab's transfer queue. The engine reports a few
+ * times a second, carrying only the transfers that changed since the last batch.
+ */
+export type TransfersUpdated = { sessionId: number; updates: TransferUpdateDto[] }
 /**
  * A newer release was found by the startup check (tech-gui.md §4.3). Mapped by the
  * shared engine bridge from `CoreEvent::UpdateAvailable`; drives the update banner.

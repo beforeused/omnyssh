@@ -1,4 +1,5 @@
 import { writable } from 'svelte/store';
+import type { EditorDto } from '$lib/bindings';
 
 // The metric auto-refresh interval, in seconds (tech-gui.md §4.3). A UI preference —
 // persisted via tauri-plugin-store with a localStorage mirror, exactly like the sidebar
@@ -102,3 +103,99 @@ export function driveMetricsRefresh(
     if (timer !== undefined) clearInterval_(timer);
   };
 }
+
+// ---------------------------------------------------------------------------
+// Files: the editor that opens files, and how many parallel connections a host's
+// transfers may use. Persisted like the refresh interval (localStorage mirror for
+// the first paint, tauri-plugin-store as the canonical copy).
+// ---------------------------------------------------------------------------
+
+/** A persisted UI preference. `coerce` sanitises anything read back from storage. */
+export function createPref<T>(localKey: string, storeKey: string, fallback: T, coerce: (raw: unknown) => T) {
+  function mirrored(): T {
+    try {
+      const raw = localStorage.getItem(localKey);
+      return raw == null ? fallback : coerce(JSON.parse(raw));
+    } catch {
+      return fallback;
+    }
+  }
+
+  const initial = mirrored();
+  const { subscribe, set: setStore } = writable<T>(initial);
+  let interacted = false;
+
+  function apply(value: T, user: boolean): void {
+    const next = coerce(value);
+    setStore(next);
+    try {
+      localStorage.setItem(localKey, JSON.stringify(next));
+    } catch {
+      // localStorage unavailable: the store copy is canonical.
+    }
+    if (user) {
+      interacted = true;
+      void (async () => {
+        try {
+          const { load } = await import('@tauri-apps/plugin-store');
+          const store = await load(STORE_FILE);
+          await store.set(storeKey, next);
+          await store.save();
+        } catch {
+          // Not under Tauri: the mirror suffices.
+        }
+      })();
+    }
+  }
+
+  return {
+    subscribe,
+    set: (value: T) => apply(value, true),
+    async hydrate(): Promise<void> {
+      try {
+        const { load } = await import('@tauri-apps/plugin-store');
+        const store = await load(STORE_FILE);
+        const saved = await store.get<unknown>(storeKey);
+        if (!interacted && saved !== undefined && saved !== null) apply(coerce(saved), false);
+      } catch {
+        // Store unreachable: keep the mirrored value.
+      }
+    }
+  };
+}
+
+/** Which program opens files — the same union the backend's `EditorDto` accepts. */
+export type EditorChoice = EditorDto;
+
+const SYSTEM_EDITOR: EditorChoice = { kind: 'system' };
+
+/** Coerce a stored editor choice, falling back to the OS default. */
+export function coerceEditor(raw: unknown): EditorChoice {
+  if (!raw || typeof raw !== 'object') return SYSTEM_EDITOR;
+  const r = raw as Record<string, unknown>;
+  if (r.kind === 'app' && typeof r.path === 'string' && r.path) {
+    return { kind: 'app', path: r.path, name: typeof r.name === 'string' && r.name ? r.name : r.path };
+  }
+  if (r.kind === 'command' && typeof r.command === 'string' && r.command.trim()) {
+    return { kind: 'command', command: r.command };
+  }
+  return SYSTEM_EDITOR;
+}
+
+export const editor = createPref<EditorChoice>('omnyssh-editor', 'editor', SYSTEM_EDITOR, coerceEditor);
+
+/** Parallel connections per host the settings screen offers. */
+export const STREAM_OPTIONS = [1, 2, 4, 6, 8] as const;
+const DEFAULT_STREAMS = 4;
+
+export function clampStreams(raw: unknown): number {
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isFinite(n) ? Math.min(8, Math.max(1, Math.round(n))) : DEFAULT_STREAMS;
+}
+
+export const transferStreams = createPref<number>(
+  'omnyssh-transfer-streams',
+  'transferStreams',
+  DEFAULT_STREAMS,
+  clampStreams
+);

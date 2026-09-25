@@ -4,7 +4,17 @@
 import type { Channel } from '@tauri-apps/api/core';
 import { commands } from '$lib/bindings';
 import type {
+  AuthModeDto,
+  ConflictResolutionDto,
+  HostAuthDto,
+  KeyChoiceDto,
+  SshKeyDto,
+  EditorAppDto,
+  EditorDto,
   FileEntryDto,
+  PreparedBatchDto,
+  TransferDirectionDto,
+  TransferItemDto,
   HostDto,
   HostInputDto,
   SnippetDto,
@@ -111,22 +121,6 @@ export async function sftpList(sessionId: number, path: string): Promise<void> {
   if (res.status === 'error') throw new Error(res.error.message);
 }
 
-/** Upload a local file to a remote path; progress arrives as `transfer-progress`. */
-export async function sftpUpload(sessionId: number, local: string, remote: string): Promise<void> {
-  const res = await commands.sftpUpload(sessionId, local, remote);
-  if (res.status === 'error') throw new Error(res.error.message);
-}
-
-/** Download a remote file to a local path; progress arrives as `transfer-progress`. */
-export async function sftpDownload(
-  sessionId: number,
-  local: string,
-  remote: string
-): Promise<void> {
-  const res = await commands.sftpDownload(sessionId, local, remote);
-  if (res.status === 'error') throw new Error(res.error.message);
-}
-
 /** Create a remote directory; completion arrives as `sftp-op-done`. */
 export async function sftpMkdir(sessionId: number, path: string): Promise<void> {
   const res = await commands.sftpMkdir(sessionId, path);
@@ -173,8 +167,12 @@ export async function previewLocalFile(path: string): Promise<string> {
 
 /** Start auto SSH-key setup for a host; progress + the outcome arrive as `key-setup-*`
  *  events (tech-gui.md §4.2). Fire-and-forget — only an unknown host rejects here. */
-export async function startKeySetup(hostName: string): Promise<void> {
-  const res = await commands.startKeySetup(hostName);
+export async function startKeySetup(
+  hostName: string,
+  key: KeyChoiceDto,
+  mode: AuthModeDto
+): Promise<void> {
+  const res = await commands.startKeySetup(hostName, key, mode);
   if (res.status === 'error') throw new Error(res.error.message);
 }
 
@@ -209,4 +207,131 @@ export async function loadUpdateConfig(): Promise<UpdateConfigDto> {
 export async function saveUpdateConfig(config: UpdateConfigDto): Promise<void> {
   const res = await commands.saveUpdateConfig(config);
   if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Expand `sources` into a transfer batch targeting `destDir` and report which
+ *  destinations already exist. Commit or discard the batch afterwards. */
+export async function transferPrepare(
+  sessionId: number,
+  direction: TransferDirectionDto,
+  sources: string[],
+  destDir: string
+): Promise<PreparedBatchDto> {
+  const res = await commands.transferPrepare(sessionId, direction, sources, destDir);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+/** Enqueue a prepared batch with the user's conflict answers; returns its transfers. */
+export async function transferCommit(
+  sessionId: number,
+  batchId: number,
+  resolutions: ConflictResolutionDto[]
+): Promise<TransferItemDto[]> {
+  const res = await commands.transferCommit(sessionId, batchId, resolutions);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+/** Drop a prepared batch the user backed out of. */
+export async function transferDiscard(sessionId: number, batchId: number): Promise<void> {
+  const res = await commands.transferDiscard(sessionId, batchId);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+export async function transferCancel(sessionId: number, ids: number[]): Promise<void> {
+  const res = await commands.transferCancel(sessionId, ids);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+export async function transferRetry(sessionId: number, ids: number[]): Promise<void> {
+  const res = await commands.transferRetry(sessionId, ids);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Forget transfers cleared from the queue panel. */
+export async function transferForget(sessionId: number, ids: number[]): Promise<void> {
+  const res = await commands.transferForget(sessionId, ids);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Parallel connections per host for transfers (1–8). */
+export async function setTransferStreams(streams: number): Promise<void> {
+  const res = await commands.setTransferStreams(streams);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Editors installed on this machine. */
+export async function detectEditors(): Promise<EditorAppDto[]> {
+  const res = await commands.detectEditors();
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+/** Open a local file in `editor`. */
+export async function openLocalFile(path: string, editor: EditorDto): Promise<void> {
+  const res = await commands.openLocalFile(path, editor);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Download a remote file and open it in `editor`; saves sync back (`edit-sync`). */
+export async function editRemoteFile(
+  sessionId: number,
+  remotePath: string,
+  editor: EditorDto
+): Promise<void> {
+  const res = await commands.editRemoteFile(sessionId, remotePath, editor);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Answer an edit conflict: overwrite the server copy, or reload it locally. */
+export async function editResolveConflict(
+  sessionId: number,
+  remotePath: string,
+  overwrite: boolean
+): Promise<void> {
+  const res = await commands.editResolveConflict(sessionId, remotePath, overwrite);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Answer "upload this save?" for a remote file open in an editor. */
+export async function editConfirmUpload(
+  sessionId: number,
+  remotePath: string,
+  upload: boolean
+): Promise<void> {
+  const res = await commands.editConfirmUpload(sessionId, remotePath, upload);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Private keys found in `~/.ssh`. */
+export async function listSshKeys(): Promise<SshKeyDto[]> {
+  const res = await commands.listSshKeys();
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+/** Describe a hand-picked key file; rejects when it is not a private key. */
+export async function inspectSshKey(path: string): Promise<SshKeyDto> {
+  const res = await commands.inspectSshKey(path);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+export async function getDefaultKey(): Promise<string | null> {
+  const res = await commands.getDefaultKey();
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+export async function setDefaultKey(path: string | null): Promise<void> {
+  const res = await commands.setDefaultKey(path);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Which key a host uses and whether a password is stored (never the password). */
+export async function hostAuth(hostName: string): Promise<HostAuthDto> {
+  const res = await commands.hostAuth(hostName);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
 }

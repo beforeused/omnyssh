@@ -16,8 +16,9 @@ import type {
   SftpDirListed,
   SftpDisconnected,
   SftpOpDone,
+  EditSync,
   SnippetResult,
-  TransferProgressDto
+  TransfersUpdated
 } from '$lib/bindings';
 import { hosts } from '$lib/stores/hosts';
 import { statuses } from '$lib/stores/statuses';
@@ -26,6 +27,7 @@ import { services } from '$lib/stores/services';
 import { snippetRun, reduceRunResult } from '$lib/stores/snippets';
 import { sessions } from '$lib/stores/sessions';
 import { sftp } from '$lib/stores/sftp';
+import { transfers } from '$lib/stores/transfers';
 import { closeSession } from '$lib/stores/navigation';
 import { lastError } from '$lib/stores/notifications';
 import {
@@ -83,7 +85,25 @@ export function applySnippetResult(payload: SnippetResult): void {
 // its backend id (`terminalDidExit`), rather than stranding a dead tab open.
 const exitedBeforeMapped = new Set<number>();
 
+// Terminals that are not tabs (the one docked under an SFTP tab) register their own
+// exit handler by backend id.
+const exitHandlers = new Map<number, () => void>();
+
+/** Run `handler` when backend terminal `termId` exits; returns the disposer. */
+export function onTerminalExit(termId: number, handler: () => void): () => void {
+  exitHandlers.set(termId, handler);
+  return () => {
+    if (exitHandlers.get(termId) === handler) exitHandlers.delete(termId);
+  };
+}
+
 export function applyTerminalExited(sessionId: number): void {
+  const handler = exitHandlers.get(sessionId);
+  if (handler) {
+    exitHandlers.delete(sessionId);
+    handler();
+    return;
+  }
   const target = get(sessions).find((s) => s.termId === sessionId);
   if (target) closeSession(target.id);
   else exitedBeforeMapped.add(sessionId);
@@ -120,8 +140,16 @@ export function applyFilePreview(payload: FilePreview): void {
   sftp.setPreview(payload.sessionId, { path: payload.path, content: payload.content });
 }
 
-export function applyTransferProgress(payload: TransferProgressDto): void {
-  sftp.progress(payload.sessionId, payload);
+export function applyTransfersUpdated(payload: TransfersUpdated): void {
+  transfers.apply(payload.sessionId, payload.updates);
+}
+
+export function applyEditSync(payload: EditSync): void {
+  sftp.editSync(payload.sessionId, {
+    path: payload.remotePath,
+    state: payload.state,
+    error: payload.error ?? undefined
+  });
 }
 
 // Auto key-setup events (tech-gui.md §4.2/§4.3). Progress advances only the active
@@ -133,7 +161,14 @@ export function applyKeySetupProgress(payload: KeySetupProgress): void {
 }
 
 export function applyKeySetupComplete(payload: KeySetupComplete): void {
-  keySetup.set(reduceComplete(payload.hostName, payload.keyPath));
+  keySetup.set(
+    reduceComplete(
+      payload.hostName,
+      payload.keyPath,
+      payload.passwordAuthDisabled ?? undefined,
+      payload.partial
+    )
+  );
 }
 
 export function applyKeySetupFailed(payload: KeySetupFailed): void {

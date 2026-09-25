@@ -36,6 +36,10 @@ async function boot(page: Page, opts: { fireUpdateOnBoot: boolean }): Promise<vo
 
       (win as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
         invoke: (cmd: string, args: Record<string, unknown>) => {
+          if (cmd.startsWith('plugin:opener')) {
+            ((win as { __opened?: unknown[] }).__opened ||= []).push(args.url);
+            return Promise.resolve(null);
+          }
           switch (cmd) {
             case 'list_hosts':
               return Promise.resolve([...state.hosts]);
@@ -77,7 +81,9 @@ async function boot(page: Page, opts: { fireUpdateOnBoot: boolean }): Promise<vo
   await expect(page.getByText('web-1', { exact: true })).toBeVisible();
 }
 
-test('the footer gear opens Settings; theme, interval, and update prefs work', async ({ page }) => {
+test('the footer gear opens Settings; theme and interval work, and About credits the fork', async ({
+  page
+}) => {
   await boot(page, { fireUpdateOnBoot: false });
 
   await page.getByRole('button', { name: 'Settings' }).click();
@@ -95,16 +101,14 @@ test('the footer gear opens Settings; theme, interval, and update prefs work', a
   await tenSec.click();
   await expect(tenSec).toHaveAttribute('aria-pressed', 'true');
 
-  // Check-on-startup persists via save_update_config (seeded true → toggles false).
-  const startupSwitch = page.getByRole('switch', { name: 'Check for updates on startup' });
-  await expect(startupSwitch).toHaveAttribute('aria-checked', 'true');
-  await startupSwitch.click();
-  await expect(startupSwitch).toHaveAttribute('aria-checked', 'false');
-
-  // A manual check surfaces the available version and raises the banner.
-  await page.getByRole('button', { name: 'Check now' }).click();
-  await expect(page.getByText('Version 2.0.0 is available.')).toBeVisible();
-  await expect(page.getByText('Update available — v2.0.0')).toBeVisible();
+  // No upstream update controls in this fork; About names the developer instead.
+  await expect(page.getByRole('switch', { name: 'Check for updates on startup' })).toHaveCount(0);
+  await expect(page.getByText('This build is a fork of OmnySSH')).toBeVisible();
+  await expect(page.getByText('beforeused', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '@beforeused' }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { __opened?: unknown[] }).__opened))
+    .toEqual(['https://t.me/beforeused']);
 });
 
 test('startup update-available raises the banner; dismiss hides it', async ({ page }) => {
@@ -117,25 +121,16 @@ test('startup update-available raises the banner; dismiss hides it', async ({ pa
   await expect(banner).toHaveCount(0);
 });
 
-test('a settings toggle preserves a skipVersion the banner wrote out-of-band', async ({ page }) => {
-  await boot(page, { fireUpdateOnBoot: true });
-
-  // Open Settings first so its config cache is seeded stale (skipVersion: '').
+test('switching the language to Russian translates the interface and persists', async ({ page }) => {
+  await boot(page, { fireUpdateOnBoot: false });
   await page.getByRole('button', { name: 'Settings' }).click();
+  await page.getByRole('button', { name: 'Русский' }).click();
+  await expect(page.getByRole('heading', { name: 'Настройки' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Настройки' })).toBeVisible();
+  await expect(page.locator('html')).toHaveAttribute('lang', 'ru');
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Настройки' })).toBeVisible();
+  await page.getByRole('button', { name: 'Настройки' }).click();
+  await page.getByRole('button', { name: 'English' }).click();
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-
-  // Now Skip on the banner: it writes skipVersion='2.0.0' to the shared config.
-  await page.getByRole('button', { name: 'Skip', exact: true }).click();
-  await expect(page.getByText('Update available — v2.0.0')).toHaveCount(0);
-
-  // Flipping check-on-startup must read-modify-write fresh, not clobber the skip.
-  const startupSwitch = page.getByRole('switch', { name: 'Check for updates on startup' });
-  await startupSwitch.click();
-  await expect(startupSwitch).toHaveAttribute('aria-checked', 'false');
-
-  const saved = await page.evaluate(
-    () => (window as unknown as { __savedUpdateConfig?: Record<string, unknown> }).__savedUpdateConfig
-  );
-  expect(saved?.skipVersion).toBe('2.0.0');
-  expect(saved?.checkOnStartup).toBe(false);
 });

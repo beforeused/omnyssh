@@ -10,8 +10,12 @@ use omnyssh_core::event::{
     DetectedService, MetricValue, Metrics, ProcessInfo, ServiceKind, ServiceMetric,
 };
 use omnyssh_core::ssh::client::{ConnectionStatus, Host, HostSource, MonitorMode};
-use omnyssh_core::ssh::key_setup::KeySetupStep;
+use omnyssh_core::ssh::key_setup::{AuthMode, KeySetupStep};
+use omnyssh_core::ssh::keys::SshKeyInfo;
 use omnyssh_core::ssh::sftp::FileEntry;
+use omnyssh_core::ssh::transfer::{
+    remote_split, Direction, Resolution, TransferSpec, TransferState, TransferUpdate,
+};
 use omnyssh_core::update::UpdateInfo;
 
 /// Host origin, mirrors `omnyssh_core::ssh::client::HostSource`.
@@ -90,6 +94,10 @@ pub struct HostInputDto {
     pub password: Option<String>,
     #[serde(default)]
     pub proxy_jump: Option<String>,
+    /// Drop the stored identity file (the form's "default key / agent" choice).
+    /// Without it, an absent `identityFile` keeps the stored one.
+    #[serde(default)]
+    pub clear_identity: Option<bool>,
     // `tags[]` is required on the wire (tech-gui.md §4.1); the form always sends an
     // array, so no `serde(default)` — that would emit an optional `tags?` and drift.
     pub tags: Vec<String>,
@@ -211,17 +219,191 @@ pub struct FileEntryDto {
     pub is_dir: bool,
 }
 
-/// Live progress for one SFTP upload/download (tech-gui.md §4.1). The GUI allocates
-/// `transferId` when it issues the transfer and resolves its owning `sessionId` via
-/// `transfer_owner` (§3.4); `done`/`total` are byte counts (`total` is `0` when the
-/// remote size could not be determined).
+/// Which way a transfer moves bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferDirectionDto {
+    Upload,
+    Download,
+}
+
+impl From<TransferDirectionDto> for Direction {
+    fn from(d: TransferDirectionDto) -> Self {
+        match d {
+            TransferDirectionDto::Upload => Direction::Upload,
+            TransferDirectionDto::Download => Direction::Download,
+        }
+    }
+}
+
+impl From<Direction> for TransferDirectionDto {
+    fn from(d: Direction) -> Self {
+        match d {
+            Direction::Upload => TransferDirectionDto::Upload,
+            Direction::Download => TransferDirectionDto::Download,
+        }
+    }
+}
+
+/// A destination that already exists, awaiting the user's choice. `index` keys
+/// the answer back to the planned file; `altName` is the "keep both" name.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
-pub struct TransferProgressDto {
-    pub session_id: u64,
-    pub transfer_id: u64,
+pub struct TransferConflictDto {
+    pub index: u32,
+    /// Path relative to the destination folder ("site/css/app.css").
+    pub name: String,
+    pub destination: String,
+    pub source_size: u64,
+    pub existing_size: u64,
+    pub existing_is_dir: bool,
+    pub alt_name: String,
+}
+
+/// An expanded transfer batch (folders walked) awaiting `transfer_commit`.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedBatchDto {
+    pub batch_id: u64,
+    pub files: u32,
+    pub bytes: u64,
+    pub conflicts: Vec<TransferConflictDto>,
+}
+
+/// How the user resolved one conflict.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ConflictActionDto {
+    Replace,
+    Skip,
+    KeepBoth,
+}
+
+impl From<ConflictActionDto> for Resolution {
+    fn from(a: ConflictActionDto) -> Self {
+        match a {
+            ConflictActionDto::Replace => Resolution::Replace,
+            ConflictActionDto::Skip => Resolution::Skip,
+            ConflictActionDto::KeepBoth => Resolution::KeepBoth,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictResolutionDto {
+    pub index: u32,
+    pub action: ConflictActionDto,
+}
+
+/// One enqueued transfer, returned by `transfer_commit` so the queue panel can
+/// list it before its first progress update lands.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferItemDto {
+    pub id: u64,
+    pub direction: TransferDirectionDto,
+    pub name: String,
+    pub local: String,
+    pub remote: String,
+    pub size: u64,
+}
+
+impl From<&TransferSpec> for TransferItemDto {
+    fn from(spec: &TransferSpec) -> Self {
+        let name = match spec.direction {
+            Direction::Upload => remote_split(&spec.remote).1.to_string(),
+            Direction::Download => spec
+                .local
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        Self {
+            id: spec.id,
+            direction: spec.direction.into(),
+            name,
+            local: spec.local.to_string_lossy().into_owned(),
+            remote: spec.remote.clone(),
+            size: spec.size,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferStateDto {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// Batched progress/state for one transfer (the engine reports ~7×/s).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferUpdateDto {
+    pub id: u64,
+    pub state: TransferStateDto,
     pub done: u64,
     pub total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl From<&TransferUpdate> for TransferUpdateDto {
+    fn from(u: &TransferUpdate) -> Self {
+        let (state, error) = match &u.state {
+            TransferState::Queued => (TransferStateDto::Queued, None),
+            TransferState::Running => (TransferStateDto::Running, None),
+            TransferState::Done => (TransferStateDto::Done, None),
+            TransferState::Failed(e) => (TransferStateDto::Failed, Some(e.clone())),
+            TransferState::Cancelled => (TransferStateDto::Cancelled, None),
+        };
+        Self {
+            id: u.id,
+            state,
+            done: u.done,
+            total: u.total,
+            error,
+        }
+    }
+}
+
+/// Which program opens files (Settings → Files). Internally tagged like
+/// `ConnectionStatusDto`.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum EditorDto {
+    /// The OS default app for the file type.
+    System,
+    /// A specific application (a `.app` bundle on macOS, an executable elsewhere).
+    App { name: String, path: String },
+    /// A command line; `{file}` is replaced by the path (appended when absent).
+    Command { command: String },
+}
+
+/// An editor found installed on this machine.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorAppDto {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum EditSyncStateDto {
+    /// Saved locally; asking whether to upload the new version.
+    Modified,
+    /// Saved locally; uploading the new version.
+    Uploading,
+    /// The server has the saved version.
+    Synced,
+    /// The file changed on the server since it was opened — asks before overwriting.
+    Conflict,
+    Failed,
 }
 
 /// A newer release the app can offer (tech-gui.md §4.1). `version` is the latest
@@ -248,13 +430,84 @@ pub struct UpdateConfigDto {
 
 /// One step of the auto key-setup flow, for the progress view (tech-gui.md §4.2/§4.3).
 /// `index` is 1-based (`1..=total`); `description` is the core's human-readable label.
-/// Maps from the core `KeySetupStep`.
+/// Maps from the core `KeySetupStep`. `id` names the step for the frontend's
+/// translations; `description` is the core's English text.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct KeySetupStepDto {
+    pub id: String,
     pub index: u8,
     pub total: u8,
     pub description: String,
+}
+
+/// A private key found in `~/.ssh` (or picked by hand), for the key pickers.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SshKeyDto {
+    pub path: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Passphrase-protected: usable only through the SSH agent.
+    pub encrypted: bool,
+}
+
+impl From<&SshKeyInfo> for SshKeyDto {
+    fn from(k: &SshKeyInfo) -> Self {
+        Self {
+            path: k.path.to_string_lossy().into_owned(),
+            name: k.name.clone(),
+            kind: k.kind.clone(),
+            comment: k.comment.clone(),
+            encrypted: k.encrypted,
+        }
+    }
+}
+
+/// Which key key-setup installs.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum KeyChoiceDto {
+    /// A new Ed25519 key in `~/.ssh`, named `name` (default
+    /// `omnyssh_<host>_ed25519`; an existing pair of that name is reused).
+    Generate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// An existing private key.
+    Existing { path: String },
+}
+
+/// How the server accepts logins after key setup.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum AuthModeDto {
+    KeyAndPassword,
+    KeyOnly,
+}
+
+impl From<AuthModeDto> for AuthMode {
+    fn from(m: AuthModeDto) -> Self {
+        match m {
+            AuthModeDto::KeyAndPassword => AuthMode::KeyAndPassword,
+            AuthModeDto::KeyOnly => AuthMode::KeyOnly,
+        }
+    }
+}
+
+/// A host's stored credentials as far as the key dialog and the host form need
+/// them: which key file it uses (a path, never key material) and whether a
+/// password is stored (never the password itself). Fetched per host on demand,
+/// never broadcast with the host list.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct HostAuthDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+    pub has_password: bool,
 }
 
 /// Raw PTY output bytes for a terminal session's per-session `Channel` (tech-gui.md
@@ -496,10 +749,19 @@ impl From<UpdateConfigDto> for UpdateConfig {
 
 impl From<KeySetupStep> for KeySetupStepDto {
     fn from(step: KeySetupStep) -> Self {
+        let (id, index) = match step {
+            KeySetupStep::GenerateKey => ("generateKey", 1),
+            KeySetupStep::CopyPublicKey => ("copyPublicKey", 2),
+            KeySetupStep::VerifyKeyAuth => ("verifyKeyAuth", 3),
+            KeySetupStep::DisablePassword => ("disablePassword", 4),
+            // "Password and key" mode's step 4 in place of disabling.
+            KeySetupStep::EnablePassword => ("enablePassword", 4),
+            KeySetupStep::ReloadSshd => ("reloadSshd", 5),
+            KeySetupStep::FinalCheck => ("finalCheck", 6),
+        };
         Self {
-            // The core enum is a plain C-like discriminant (`GenerateKey = 1 ..=
-            // FinalCheck = 6`), so the cast is the 1-based position directly.
-            index: step as u8,
+            id: id.to_string(),
+            index,
             total: KeySetupStep::all_steps().len() as u8,
             description: step.description().to_string(),
         }
@@ -574,6 +836,7 @@ mod tests {
             identity_file: Some("/home/me/.ssh/id_ed25519".to_string()),
             password: Some("s3cr3t-p4ss".to_string()),
             proxy_jump: Some("bastion".to_string()),
+            clear_identity: None,
             tags: vec!["prod".to_string()],
             notes: Some("primary".to_string()),
             monitoring: None,
@@ -627,6 +890,7 @@ mod tests {
             identity_file: Some(String::new()),
             password: Some(String::new()),
             proxy_jump: Some(String::new()),
+            clear_identity: None,
             tags: vec![],
             notes: Some(String::new()),
             monitoring: None,
@@ -937,22 +1201,48 @@ mod tests {
             .expect("serialise KeySetupStepDto");
         assert_eq!(
             json,
-            r#"{"index":2,"total":6,"description":"Copying public key to server"}"#
+            r#"{"id":"copyPublicKey","index":2,"total":6,"description":"Copying public key to server"}"#
         );
     }
 
     #[test]
-    fn transfer_progress_dto_carries_session_transfer_and_byte_counts() {
-        let json = serde_json::to_string(&TransferProgressDto {
-            session_id: 3,
-            transfer_id: 7,
+    fn enabling_passwords_stands_in_for_step_four() {
+        let dto = KeySetupStepDto::from(KeySetupStep::EnablePassword);
+        assert_eq!(
+            (dto.id.as_str(), dto.index, dto.total),
+            ("enablePassword", 4, 6)
+        );
+    }
+
+    #[test]
+    fn transfer_update_dto_flattens_the_failure_reason() {
+        let failed = TransferUpdate {
+            id: 7,
+            state: TransferState::Failed("disk full".into()),
             done: 512,
             total: 2048,
-        })
-        .expect("serialise TransferProgressDto");
+        };
         assert_eq!(
-            json,
-            r#"{"sessionId":3,"transferId":7,"done":512,"total":2048}"#
+            serde_json::to_string(&TransferUpdateDto::from(&failed)).unwrap(),
+            r#"{"id":7,"state":"failed","done":512,"total":2048,"error":"disk full"}"#
         );
+        let done = TransferUpdate {
+            state: TransferState::Done,
+            ..failed
+        };
+        assert_eq!(
+            serde_json::to_string(&TransferUpdateDto::from(&done)).unwrap(),
+            r#"{"id":7,"state":"done","done":512,"total":2048}"#
+        );
+    }
+
+    #[test]
+    fn editor_dto_is_internally_tagged() {
+        let app: EditorDto =
+            serde_json::from_str(r#"{"kind":"app","name":"Zed","path":"/Applications/Zed.app"}"#)
+                .unwrap();
+        assert!(matches!(app, EditorDto::App { ref name, .. } if name == "Zed"));
+        let system: EditorDto = serde_json::from_str(r#"{"kind":"system"}"#).unwrap();
+        assert!(matches!(system, EditorDto::System));
     }
 }

@@ -32,21 +32,39 @@ async function boot(page: Page): Promise<void> {
             case 'reload_hosts':
               setTimeout(() => fire('hosts-loaded', [...state.hosts]), 0);
               return Promise.resolve(null);
+            case 'list_ssh_keys':
+              return Promise.resolve([
+                { path: '/home/me/.ssh/id_ed25519', name: 'id_ed25519', kind: 'ed25519', comment: 'me@laptop', encrypted: false },
+                { path: '/home/me/.ssh/work', name: 'work', kind: 'rsa', encrypted: false }
+              ]);
+            case 'get_default_key':
+              return Promise.resolve('/home/me/.ssh/work');
+            case 'host_auth':
+              return Promise.resolve({ hasPassword: true });
             case 'start_key_setup': {
               const name = args.hostName as string;
-              const step = (index: number, description: string) =>
-                fire('key-setup-progress', { hostName: name, step: { index, total: 6, description } });
-              setTimeout(() => step(1, 'Generating Ed25519 key pair'), 40);
-              setTimeout(() => step(3, 'Verifying key authentication'), 120);
+              (win as { __keySetupArgs?: unknown }).__keySetupArgs = { key: args.key, mode: args.mode };
+              const keyOnly = args.mode === 'keyOnly';
+              const key = args.key as { kind: string; path?: string };
+              const keyPath = key.kind === 'existing' ? key.path : `/home/me/.ssh/${(key as { name?: string }).name ?? `omnyssh_${name}_ed25519`}`;
+              const step = (id: string, index: number) =>
+                fire('key-setup-progress', { hostName: name, step: { id, index, total: 6, description: id } });
+              setTimeout(() => step('generateKey', 1), 40);
+              setTimeout(() => step('verifyKeyAuth', 3), 120);
               setTimeout(() => {
                 // The real backend persists the key before emitting complete; mirror
                 // that so the panel's reload shows a keyed host.
                 const h = state.hosts.find((x) => (x as { name: string }).name === name);
                 if (h) {
                   h.hasKey = true;
-                  h.passwordAuthDisabled = true;
+                  h.passwordAuthDisabled = keyOnly;
                 }
-                fire('key-setup-complete', { hostName: name, keyPath: `/home/me/.ssh/omnyssh_${name}_ed25519` });
+                fire('key-setup-complete', {
+                  hostName: name,
+                  keyPath,
+                  passwordAuthDisabled: keyOnly,
+                  partial: false
+                });
               }, 400);
               return Promise.resolve(null);
             }
@@ -72,27 +90,66 @@ async function boot(page: Page): Promise<void> {
   await expect(page.getByText('pw-host', { exact: true })).toBeVisible();
 }
 
-test('prompts key setup, streams progress, then reflects key auth on the card', async ({ page }) => {
+test('the key button installs an existing key, key-only, and the card reflects it', async ({ page }) => {
   await boot(page);
 
-  // A password host with no key offers the host-first "Set up key" action (§4.2).
-  await page.getByRole('button', { name: 'Set up an SSH key for pw-host' }).click();
+  // Every card carries the key button.
+  await page.getByRole('button', { name: 'SSH key for pw-host' }).click();
+  const setup = page.getByRole('dialog', { name: 'SSH key — pw-host' });
+  await expect(setup).toBeVisible();
 
-  const dialog = page.getByRole('dialog', { name: 'Key setup' });
-  await expect(dialog).toBeVisible();
+  // With no key of its own, the host starts on the default key from Settings; the
+  // found keys are listed as cards.
+  await expect(setup.getByRole('tab', { name: 'Existing key' })).toHaveAttribute('aria-selected', 'true');
+  await expect(setup.getByRole('radio', { name: 'work', exact: true })).toHaveAttribute('aria-checked', 'true');
+  // Pick another found key, and key-only logins.
+  await setup.getByRole('radio', { name: 'id_ed25519', exact: true }).click();
+  await expect(setup.getByRole('radio', { name: 'id_ed25519', exact: true })).toHaveAttribute('aria-checked', 'true');
+  await setup.getByRole('radio', { name: 'Key only' }).check();
+  await setup.getByRole('button', { name: 'Install key' }).click();
 
-  // A step streams in while the flow runs.
-  await expect(dialog.getByText('Verifying key authentication')).toBeVisible();
+  const progress = page.getByRole('dialog', { name: 'SSH key setup — pw-host' });
+  await expect(progress).toBeVisible();
+  await expect(progress.getByText('Checking that the key logs in')).toBeVisible();
+  await expect(progress.getByText('Key installed')).toBeVisible();
+  await expect(progress.getByText('Only key logins are allowed now.')).toBeVisible();
+  await expect(progress.getByText('/home/me/.ssh/id_ed25519')).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { __keySetupArgs: unknown }).__keySetupArgs)).toEqual({
+    key: { kind: 'existing', path: '/home/me/.ssh/id_ed25519' },
+    mode: 'keyOnly'
+  });
 
-  // Completion shows the generated key path.
-  await expect(dialog.getByText('Key authentication configured')).toBeVisible();
-  await expect(dialog.getByText(/omnyssh_pw-host_ed25519/)).toBeVisible();
-
-  await dialog.getByRole('button', { name: 'Done' }).click();
+  await progress.getByRole('button', { name: 'Done' }).click();
   await expect(page.getByRole('dialog')).toHaveCount(0);
-
-  // The reload flipped hasKey/passwordAuthDisabled: the card now reads key-only and no
-  // longer offers key setup.
   await expect(page.getByText('key-only')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Set up an SSH key for pw-host' })).toHaveCount(0);
+  // The button stays: the key and login mode can be changed any time.
+  await expect(page.getByRole('button', { name: 'SSH key for pw-host' })).toBeVisible();
+});
+
+test('a new key with password and key logins keeps passwords on', async ({ page }) => {
+  await boot(page);
+  await page.getByRole('button', { name: 'SSH key for pw-host' }).click();
+  const setup = page.getByRole('dialog', { name: 'SSH key — pw-host' });
+  await setup.getByRole('tab', { name: 'New key' }).click();
+  const name = setup.getByRole('textbox');
+  await expect(name).toHaveValue('omnyssh_pw-host_ed25519');
+  // A name already in ~/.ssh, or one with a path in it, is refused.
+  await name.fill('work');
+  await expect(setup.getByText(/already exists/)).toBeVisible();
+  await expect(setup.getByRole('button', { name: 'Install key' })).toBeDisabled();
+  await name.fill('../evil');
+  await expect(setup.getByText(/Use only Latin letters/)).toBeVisible();
+  await name.fill('deploy_prod');
+  await expect(setup.getByText('An Ed25519 key. Saved as ~/.ssh/deploy_prod and ~/.ssh/deploy_prod.pub.')).toBeVisible();
+  await expect(setup.getByRole('radio', { name: 'Password and key' })).toBeChecked();
+  await setup.getByRole('button', { name: 'Install key' }).click();
+
+  const progress = page.getByRole('dialog', { name: 'SSH key setup — pw-host' });
+  await expect(progress.getByText('Both the key and the password log in.')).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { __keySetupArgs: unknown }).__keySetupArgs)).toEqual({
+    key: { kind: 'generate', name: 'deploy_prod' },
+    mode: 'keyAndPassword'
+  });
+  await progress.getByRole('button', { name: 'Done' }).click();
+  await expect(page.getByText('key', { exact: true })).toBeVisible();
 });

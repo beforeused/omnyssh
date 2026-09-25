@@ -8,15 +8,19 @@ import {
   toggleMark,
   markedEntries,
   mergeRefresh,
-  applyProgress,
   applyOpDone,
+  applyEditSync,
+  selectOnly,
+  selectRange,
+  selectAll,
   formatBytes,
   type Pane,
   type SftpSession
 } from './sftp';
 
-// The dual-pane browser's navigation/marking/transfer logic lives as pure reducers so
-// it is unit-testable without a Tauri runtime (tech-gui.md §3.2, §6.4).
+// The dual-pane browser's navigation/selection logic lives as pure reducers so it is
+// unit-testable without a Tauri runtime (tech-gui.md §3.2, §6.4). Transfers have
+// their own store (transfers.test.ts).
 
 function entry(name: string, isDir = false, size = 0): FileEntryDto {
   return { name, path: `/srv/${name}`, size, isDir };
@@ -46,6 +50,50 @@ describe('sftp reducers', () => {
     expect(next.marked.size).toBe(0);
   });
 
+  it('applyListing keeps the surviving selection when the same folder is re-listed', () => {
+    const pane = paneWith([entry('a'), entry('b')], ['/srv/a', '/srv/b']);
+    // `b` was deleted meanwhile; `c` landed from a transfer.
+    const next = applyListing(pane, '/srv', [entry('a'), entry('c')]);
+    expect([...next.marked]).toEqual(['/srv/a']);
+  });
+
+  it('selectOnly / selectRange / selectAll follow file-manager conventions', () => {
+    let pane = paneWith([
+      { name: '..', path: '/', size: 0, isDir: true },
+      entry('a'),
+      entry('b'),
+      entry('c'),
+      entry('d')
+    ]);
+    pane = selectOnly(pane, '/srv/b');
+    expect([...pane.marked]).toEqual(['/srv/b']);
+    // Shift-click extends from the anchor, in either direction.
+    pane = selectRange(pane, '/srv/d');
+    expect(markedEntries(pane).map((e) => e.name)).toEqual(['b', 'c', 'd']);
+    pane = selectRange(pane, '/srv/a');
+    expect(markedEntries(pane).map((e) => e.name)).toEqual(['a', 'b']);
+    // Cmd-click toggles and moves the anchor.
+    pane = toggleMark(pane, '/srv/d');
+    expect(markedEntries(pane).map((e) => e.name)).toEqual(['a', 'b', 'd']);
+    expect(pane.anchor).toBe('/srv/d');
+    // Select-all never includes `..`.
+    expect(markedEntries(selectAll(pane)).map((e) => e.name)).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('applyEditSync queues one question per file and clears it on a later status', () => {
+    let s = newSession('web-1');
+    s = applyEditSync(s, { path: '/etc/app.conf', state: 'modified' });
+    s = applyEditSync(s, { path: '/etc/app.conf', state: 'modified' });
+    expect(s.editPrompts).toEqual([{ path: '/etc/app.conf', kind: 'modified' }]);
+    // The upload found the server copy changed: the question becomes a conflict.
+    s = applyEditSync(s, { path: '/etc/app.conf', state: 'conflict' });
+    expect(s.editPrompts).toEqual([{ path: '/etc/app.conf', kind: 'conflict' }]);
+    s = applyEditSync(s, { path: '/etc/app.conf', state: 'synced' });
+    expect(s.editPrompts).toEqual([]);
+    expect(s.edit).toEqual({ path: '/etc/app.conf', state: 'synced' });
+  });
+
+
   it('toggleMark marks and unmarks, and markedEntries keeps listing order', () => {
     let pane = paneWith([entry('a'), entry('b'), entry('c')]);
     pane = toggleMark(pane, '/srv/c');
@@ -63,37 +111,17 @@ describe('sftp reducers', () => {
     expect(mergeRefresh('both', 'local')).toBe('both');
   });
 
-  it('applyProgress binds a tick to the front pending transfer op', () => {
-    const s: SftpSession = {
-      ...newSession('web-1'),
-      pending: [{ kind: 'upload', name: 'a.txt', refresh: 'remote' }]
-    };
-    const next = applyProgress(s, { sessionId: 1, transferId: 9, done: 50, total: 100 });
-    expect(next.transfer).toEqual({ kind: 'upload', name: 'a.txt', done: 50, total: 100 });
-  });
-
-  it('applyProgress ignores a tick when the front op is not a transfer', () => {
-    const s: SftpSession = {
-      ...newSession('web-1'),
-      pending: [{ kind: 'mkdir', refresh: 'remote' }]
-    };
-    expect(applyProgress(s, { sessionId: 1, transferId: 9, done: 1, total: 2 }).transfer).toBeUndefined();
-  });
-
-  it('applyOpDone pops the front op (FIFO), records its refresh, and clears a transfer', () => {
+  it('applyOpDone pops the front op (FIFO) and records its refresh', () => {
     const s: SftpSession = {
       ...newSession('web-1'),
       pending: [
-        { kind: 'upload', name: 'a', refresh: 'remote' },
+        { kind: 'rename', name: 'a', refresh: 'remote' },
         { kind: 'mkdir', refresh: 'remote' }
-      ],
-      transfer: { kind: 'upload', name: 'a', done: 100, total: 100 }
+      ]
     };
     const next = applyOpDone(s, true);
     expect(next.pending.map((p) => p.kind)).toEqual(['mkdir']);
     expect(next.refresh).toBe('remote');
-    // The finished op was the transfer, so its bar is cleared.
-    expect(next.transfer).toBeUndefined();
     expect(next.error).toBeUndefined();
   });
 
@@ -122,27 +150,6 @@ describe('sftp reducers', () => {
     s = applyOpDone(s, true);
     expect(s.error).toBe('directory not empty');
     expect(s.pending).toEqual([]);
-  });
-
-  it('correlates a two-file batch by FIFO order across progress + op-done', () => {
-    // The core is sequential, so the front pending op is always the one running: A's
-    // progress shows A; A's op-done pops it; then B's progress shows B (§3.2/§4.3).
-    let s: SftpSession = {
-      ...newSession('web-1'),
-      pending: [
-        { kind: 'upload', name: 'A', refresh: 'remote' },
-        { kind: 'upload', name: 'B', refresh: 'remote' }
-      ]
-    };
-    s = applyProgress(s, { sessionId: 1, transferId: 1, done: 5, total: 10 });
-    expect(s.transfer?.name).toBe('A');
-    s = applyOpDone(s, true);
-    expect(s.transfer).toBeUndefined();
-    s = applyProgress(s, { sessionId: 1, transferId: 2, done: 3, total: 3 });
-    expect(s.transfer?.name).toBe('B');
-    s = applyOpDone(s, true);
-    expect(s.pending).toEqual([]);
-    expect(s.refresh).toBe('remote');
   });
 
   it('formatBytes is human readable', () => {

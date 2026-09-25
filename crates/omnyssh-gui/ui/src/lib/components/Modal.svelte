@@ -4,6 +4,7 @@
   // click to close — but a solid raised surface for readable forms. Content is
   // passed in; the chrome (scrim, box, key handling) is fixed here so the snippet
   // dialogs don't each re-implement it.
+  import { t } from '$lib/i18n';
   import type { Snippet } from 'svelte';
 
   let {
@@ -31,7 +32,7 @@
   <button
     type="button"
     tabindex="-1"
-    aria-label="Dismiss"
+    aria-label={$t('palette.dismiss')}
     class="absolute inset-0 bg-overlay"
     onclick={onClose}
   ></button>

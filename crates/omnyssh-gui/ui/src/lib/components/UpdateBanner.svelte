@@ -5,6 +5,7 @@
   // (§3.7, Stage 5), so `install_update` cannot succeed on any platform, and a button that
   // only ever reports a failure is worse than a download link. Skip persists the version to
   // the shared config so it is never offered again; Dismiss hides it for this session only.
+  import { t } from '$lib/i18n';
   import { Icon } from '$lib/theme';
   import { availableUpdate, dismissUpdate } from '$lib/stores/update';
   import { loadUpdateConfig, saveUpdateConfig } from '$lib/ipc/commands';
@@ -49,8 +50,8 @@
     >
       <span class="shrink-0 text-muted"><Icon name="download" size={18} /></span>
       <div class="min-w-0">
-        <p class="text-sm font-medium">Update available — v{info.version}</p>
-        <p class="truncate text-xs text-muted">A newer OmnySSH release is ready.</p>
+        <p class="text-sm font-medium">{$t('update.available', { version: info.version })}</p>
+        <p class="truncate text-xs text-muted">{$t('update.ready')}</p>
       </div>
       <div class="ml-auto flex shrink-0 items-center gap-1.5">
         <button
@@ -59,7 +60,7 @@
           disabled={busy}
           onclick={() => download(info.url)}
         >
-          Download
+          {$t('update.download')}
         </button>
         <button
           type="button"
@@ -67,13 +68,13 @@
           disabled={busy}
           onclick={() => skip(info.version)}
         >
-          Skip
+          {$t('update.skip')}
         </button>
         <button
           type="button"
           class="grid h-8 w-8 place-items-center rounded-full text-muted transition hover:bg-surface-inset hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-          title="Dismiss"
-          aria-label="Dismiss update notice"
+          title={$t('update.dismiss')}
+          aria-label={$t('update.dismissLabel')}
           onclick={dismissUpdate}
         >
           <Icon name="close" size={15} />

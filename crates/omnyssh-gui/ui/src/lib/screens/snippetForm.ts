@@ -3,6 +3,7 @@
 // validation mirrors the TUI's `SnippetForm::to_snippet` so both frontends produce
 // the same `snippets.toml` shape.
 
+import { tr } from '$lib/i18n';
 import type { SnippetDto, SnippetScopeDto } from '$lib/bindings';
 
 /** The editable form fields (tags/params are comma-separated raw text). */
@@ -45,9 +46,9 @@ export type FormResult = { ok: true; snippet: SnippetDto } | { ok: false; error:
  *  dropped to `undefined` when empty (so the wire form stays sparse, §4.1). */
 export function formToSnippet(f: SnippetFormFields): FormResult {
   const name = f.name.trim();
-  if (!name) return { ok: false, error: 'Name cannot be empty' };
+  if (!name) return { ok: false, error: tr('snip.err.name') };
   const command = f.command.trim();
-  if (!command) return { ok: false, error: 'Command cannot be empty' };
+  if (!command) return { ok: false, error: tr('snip.err.command') };
   const scope: SnippetScopeDto = f.scope === 'host' ? 'host' : 'global';
   const host = f.host.trim();
   if (scope === 'host' && !host) {
