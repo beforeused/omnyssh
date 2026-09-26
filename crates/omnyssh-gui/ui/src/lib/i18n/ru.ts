@@ -145,6 +145,7 @@ export const ru: Record<MessageKey, Message> = {
   'keypass.label': "Пароль от ключа",
   'keypass.memoryOnly': "Хранится только в памяти до выхода из OmnySSH и не записывается на диск.",
   'keypass.invalid': "Неверный пароль от ключа. Попробуйте ещё раз.",
+  'keypass.agent': "Через SSH-агент",
   'keypass.connect': "Разблокировать и подключиться",
   'keysetup.progressTitle': "Настройка SSH-ключа — {host}",
   'keysetup.connecting': "Подключение…",

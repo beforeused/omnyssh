@@ -144,6 +144,7 @@ export const en = {
   'keypass.label': "Key passphrase",
   'keypass.memoryOnly': "Kept in memory only until OmnySSH quits; never saved to disk.",
   'keypass.invalid': "The passphrase is incorrect. Try again.",
+  'keypass.agent': "Use SSH agent",
   'keypass.connect': "Unlock and connect",
   'keysetup.progressTitle': "SSH key setup — {host}",
   'keysetup.connecting': "Connecting…",

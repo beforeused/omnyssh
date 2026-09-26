@@ -86,6 +86,13 @@
       </div>
 
       <footer class="flex justify-end gap-2 border-t border-default px-5 py-3">
+        <Button
+          variant="ghost"
+          onclick={() => keyPassphrasePrompt.answer(true)}
+          disabled={unlocking}
+        >
+          {$t('keypass.agent')}
+        </Button>
         <Button variant="ghost" onclick={close} disabled={unlocking}>{$t('common.cancel')}</Button>
         <Button variant="primary" type="submit" disabled={!passphrase || unlocking}>
           {$t('keypass.connect')}
