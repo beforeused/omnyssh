@@ -137,6 +137,10 @@
                 {#if item.state === 'running'}
                   {formatBytes(item.done)} / {formatBytes(item.total)}{#if item.speed > 0}
                     · {formatBytes(item.speed)}/s{/if}
+                {:else if item.state === 'reconnecting'}
+                  <span class="text-status-warn" title={$t('transfers.reconnectingHint')}>
+                    {$t('transfers.reconnecting')} · {formatBytes(item.done)} / {formatBytes(item.total)}
+                  </span>
                 {:else if item.state === 'queued'}
                   {$t('transfers.waiting')} · {formatBytes(item.total)}
                 {:else if item.state === 'done'}

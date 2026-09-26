@@ -17,6 +17,7 @@ import type {
   SftpDisconnected,
   SftpOpDone,
   EditSync,
+  VpnInstallProgress,
   SnippetResult,
   TransfersUpdated
 } from '$lib/bindings';
@@ -28,6 +29,7 @@ import { snippetRun, reduceRunResult } from '$lib/stores/snippets';
 import { sessions } from '$lib/stores/sessions';
 import { sftp } from '$lib/stores/sftp';
 import { transfers } from '$lib/stores/transfers';
+import { vpnInstallState, installStateFrom } from '$lib/stores/vpn';
 import { closeSession } from '$lib/stores/navigation';
 import { lastError } from '$lib/stores/notifications';
 import {
@@ -186,4 +188,8 @@ export function applyUpdateAvailable(payload: UpdateAvailable): void {
 
 export function applyError(message: string): void {
   lastError.set(message);
+}
+
+export function applyVpnInstallProgress(payload: VpnInstallProgress): void {
+  vpnInstallState.set(installStateFrom(payload));
 }

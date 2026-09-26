@@ -646,6 +646,7 @@ mod tests {
             path: path.to_string(),
             size: 0,
             is_dir: false,
+            ..Default::default()
         }
     }
 

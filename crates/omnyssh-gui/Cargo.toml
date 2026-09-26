@@ -29,6 +29,8 @@ tokio = { workspace = true }
 chrono = { workspace = true }
 # Home directory for finding editors installed per-user (~/Applications, ~/.local/bin).
 dirs = { workspace = true }
+# Local deletes go to the Trash (recoverable) rather than being unlinked.
+trash = "5"
 # tauri-specta v2 + specta v2 are release candidates (tech-gui.md §3.3): pin exact
 # rc versions. rc.21 is the last combo docs.rs builds; upgrades need re-verification.
 specta = { version = "=2.0.0-rc.22", features = ["derive", "function"] }

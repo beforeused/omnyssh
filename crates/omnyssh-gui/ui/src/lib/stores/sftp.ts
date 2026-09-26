@@ -113,8 +113,8 @@ export function selectOnly(pane: Pane, path: string): Pane {
 
 /** Select everything between the anchor and `path` (a Shift-click), in listing
  *  order. Without an anchor this is a plain selection. */
-export function selectRange(pane: Pane, path: string): Pane {
-  const selectable = pane.entries.filter((e) => e.name !== '..');
+export function selectRange(pane: Pane, path: string, order: FileEntryDto[] = pane.entries): Pane {
+  const selectable = order.filter((e) => e.name !== '..');
   const to = selectable.findIndex((e) => e.path === path);
   const from = pane.anchor ? selectable.findIndex((e) => e.path === pane.anchor) : -1;
   if (to < 0 || from < 0) return selectOnly(pane, path);
@@ -127,10 +127,10 @@ export function selectRange(pane: Pane, path: string): Pane {
 }
 
 /** Select every entry but `..` (Cmd/Ctrl-A). */
-export function selectAll(pane: Pane): Pane {
+export function selectAll(pane: Pane, order: FileEntryDto[] = pane.entries): Pane {
   return {
     ...pane,
-    marked: new Set(pane.entries.filter((e) => e.name !== '..').map((e) => e.path))
+    marked: new Set(order.filter((e) => e.name !== '..').map((e) => e.path))
   };
 }
 
@@ -226,11 +226,11 @@ function createSftp() {
     selectOnly(id: number, side: PaneSide, path: string): void {
       mut(id, (s) => ({ ...s, [side]: selectOnly(s[side], path) }));
     },
-    selectRange(id: number, side: PaneSide, path: string): void {
-      mut(id, (s) => ({ ...s, [side]: selectRange(s[side], path) }));
+    selectRange(id: number, side: PaneSide, path: string, order?: FileEntryDto[]): void {
+      mut(id, (s) => ({ ...s, [side]: selectRange(s[side], path, order) }));
     },
-    selectAll(id: number, side: PaneSide): void {
-      mut(id, (s) => ({ ...s, [side]: selectAll(s[side]) }));
+    selectAll(id: number, side: PaneSide, order?: FileEntryDto[]): void {
+      mut(id, (s) => ({ ...s, [side]: selectAll(s[side], order) }));
     },
     clearSelection(id: number, side: PaneSide): void {
       mut(id, (s) => ({ ...s, [side]: { ...s[side], marked: new Set<string>() } }));
@@ -281,3 +281,110 @@ function createSftp() {
 }
 
 export const sftp = createSftp();
+
+// ---------------------------------------------------------------------------
+// File-manager view: what a pane shows, in which order
+// ---------------------------------------------------------------------------
+
+export type SortKey = 'name' | 'size' | 'modified';
+export interface SortSpec {
+  key: SortKey;
+  dir: 'asc' | 'desc';
+}
+
+export interface ViewOptions {
+  showHidden: boolean;
+  filter: string;
+  sort: SortSpec;
+}
+
+const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+/** The entries a pane shows: hidden files and the filter applied, folders first,
+ *  then by the chosen column. `..` stays on top (and survives the filter). */
+export function viewEntries(entries: FileEntryDto[], opts: ViewOptions): FileEntryDto[] {
+  const q = opts.filter.trim().toLowerCase();
+  const parent = entries.filter((e) => e.name === '..');
+  const rest = entries.filter(
+    (e) =>
+      e.name !== '..' &&
+      (opts.showHidden || !e.name.startsWith('.')) &&
+      (!q || e.name.toLowerCase().includes(q))
+  );
+  const sign = opts.sort.dir === 'asc' ? 1 : -1;
+  rest.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    let c = 0;
+    if (opts.sort.key === 'size') c = (a.isDir ? 0 : a.size) - (b.isDir ? 0 : b.size);
+    else if (opts.sort.key === 'modified') c = (a.modified ?? 0) - (b.modified ?? 0);
+    if (c === 0) c = collator.compare(a.name, b.name);
+    return c * sign;
+  });
+  return [...parent, ...rest];
+}
+
+/** Clicking a column: sort by it, or flip the direction when it already is. */
+export function toggleSort(sort: SortSpec, key: SortKey): SortSpec {
+  if (sort.key === key) return { key, dir: sort.dir === 'asc' ? 'desc' : 'asc' };
+  // Newest and biggest first are what people look for.
+  return { key, dir: key === 'name' ? 'asc' : 'desc' };
+}
+
+/** Path segments for a breadcrumb bar; each carries the path it opens. */
+export function breadcrumbs(path: string): Array<{ label: string; path: string }> {
+  if (!path) return [];
+  const windows = /^[A-Za-z]:[\\/]/.test(path);
+  const sep = windows ? '\\' : '/';
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  if (windows) {
+    const [drive, ...tail] = parts;
+    const crumbs = [{ label: drive, path: `${drive}\\` }];
+    let acc = `${drive}`;
+    for (const p of tail) {
+      acc += `${sep}${p}`;
+      crumbs.push({ label: p, path: acc });
+    }
+    return crumbs;
+  }
+  const crumbs = [{ label: '/', path: '/' }];
+  let acc = '';
+  for (const p of parts) {
+    acc += `/${p}`;
+    crumbs.push({ label: p, path: acc });
+  }
+  return crumbs;
+}
+
+/** `drwxr-xr-x`-style text for permission bits (setuid/setgid/sticky included). */
+export function permString(mode: number | null | undefined, isDir: boolean): string {
+  if (mode == null) return '';
+  const bit = (b: number, c: string) => (mode & b ? c : '-');
+  const x = (b: number, special: number, set: string, unset: string) =>
+    mode & special ? (mode & b ? set : unset) : bit(b, 'x');
+  return (
+    (isDir ? 'd' : '-') +
+    bit(0o400, 'r') +
+    bit(0o200, 'w') +
+    x(0o100, 0o4000, 's', 'S') +
+    bit(0o040, 'r') +
+    bit(0o020, 'w') +
+    x(0o010, 0o2000, 's', 'S') +
+    bit(0o004, 'r') +
+    bit(0o002, 'w') +
+    x(0o001, 0o1000, 't', 'T')
+  );
+}
+
+/** Folder containing `path` ('/' for a top-level entry). */
+export function parentPath(path: string): string {
+  const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  if (cut < 0) return path;
+  if (cut === 0) return path.slice(0, 1);
+  if (/^[A-Za-z]:$/.test(path.slice(0, cut))) return path.slice(0, cut + 1);
+  return path.slice(0, cut);
+}
+
+/** Archives the server can unpack (mirrors the core's `remote_fs::is_archive`). */
+export function isArchive(name: string): boolean {
+  return /\.(tar|tar\.gz|tgz|tar\.bz2|tbz2?|tar\.xz|txz|tar\.zst|zip|gz)$/i.test(name);
+}

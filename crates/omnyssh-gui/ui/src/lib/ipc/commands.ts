@@ -5,6 +5,11 @@ import type { Channel } from '@tauri-apps/api/core';
 import { commands } from '$lib/bindings';
 import type {
   AuthModeDto,
+  DockerActionDto,
+  DockerListDto,
+  LocalFsOpDto,
+  RemoteFsOpDto,
+  VpnStatusDto,
   ConflictResolutionDto,
   HostAuthDto,
   KeyChoiceDto,
@@ -334,4 +339,78 @@ export async function hostAuth(hostName: string): Promise<HostAuthDto> {
   const res = await commands.hostAuth(hostName);
   if (res.status === 'error') throw new Error(res.error.message);
   return res.data;
+}
+
+/** A file operation SFTP has no verb for, run on the SFTP tab's server. */
+export async function remoteFsOp(sessionId: number, op: RemoteFsOpDto): Promise<void> {
+  const res = await commands.remoteFsOp(sessionId, op);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** A file operation on this machine (new folder/file, rename, move to Trash). */
+export async function localFsOp(op: LocalFsOpDto): Promise<void> {
+  const res = await commands.localFsOp(op);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+export async function dockerList(hostName: string): Promise<DockerListDto> {
+  const res = await commands.dockerList(hostName);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+export async function dockerAction(hostName: string, id: string, action: DockerActionDto): Promise<void> {
+  const res = await commands.dockerAction(hostName, id, action);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+export async function dockerLogs(hostName: string, id: string, tail: number): Promise<string> {
+  const res = await commands.dockerLogs(hostName, id, tail);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+export async function dockerShellCommand(id: string, sudo: boolean): Promise<string> {
+  const res = await commands.dockerShellCommand(id, sudo);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+export async function vpnStatus(): Promise<VpnStatusDto> {
+  const res = await commands.vpnStatus();
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+export async function vpnConfigurations(): Promise<string[]> {
+  const res = await commands.vpnConfigurations();
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+export async function vpnImport(path: string): Promise<void> {
+  const res = await commands.vpnImport(path);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+export async function vpnState(name: string): Promise<string> {
+  const res = await commands.vpnState(name);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+export async function vpnConnect(name: string): Promise<void> {
+  const res = await commands.vpnConnect(name);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+export async function vpnDisconnect(name: string): Promise<void> {
+  const res = await commands.vpnDisconnect(name);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Download, verify and install Tunnelblick (progress via `vpn-install-progress`). */
+export async function vpnInstall(): Promise<void> {
+  const res = await commands.vpnInstall();
+  if (res.status === 'error') throw new Error(res.error.message);
 }

@@ -40,7 +40,7 @@ export const EMPTY_QUEUE: TransferQueue = { items: [], landed: { local: [], remo
 const SPEED_ALPHA = 0.3;
 
 export function isActive(state: TransferStateDto): boolean {
-  return state === 'queued' || state === 'running';
+  return state === 'queued' || state === 'running' || state === 'reconnecting';
 }
 
 /** Parent folder of a local or remote path ('/' for a top-level entry). */

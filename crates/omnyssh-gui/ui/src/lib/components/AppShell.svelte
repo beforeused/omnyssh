@@ -10,6 +10,7 @@
   import SupportModal from './SupportModal.svelte';
   import KeySetupProgress from '$lib/screens/KeySetupProgress.svelte';
   import UpdateBanner from './UpdateBanner.svelte';
+  import TunnelblickBanner from './TunnelblickBanner.svelte';
   import { support } from '$lib/stores/support';
   import { sidebarCollapsed, isCollapseChord } from '$lib/stores/ui';
 
@@ -43,5 +44,6 @@
     <SupportModal />
   {/if}
   <KeySetupProgress />
+  <TunnelblickBanner />
   <UpdateBanner />
 </div>

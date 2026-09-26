@@ -7,13 +7,23 @@
   // key, the agent and ~/.ssh/id_*. A password is optional. Semantic tokens only.
   import { onMount } from 'svelte';
   import type { HostInputDto } from '$lib/bindings';
-  import { Button } from '$lib/theme';
+  import { Button, Icon } from '$lib/theme';
   import Modal from '$lib/components/Modal.svelte';
   import Select from '$lib/components/Select.svelte';
   import KeyPicker from '$lib/components/KeyPicker.svelte';
   import { formToInput, type HostFormFields } from './hostForm';
   import { hostAuth } from '$lib/ipc/commands';
   import { defaultKey, loadDefaultKey, keyFileName } from '$lib/stores/keys';
+  import {
+    vpn,
+    vpnConfigs,
+    vpnConfigsError,
+    vpnInstallState,
+    loadVpnStatus,
+    loadVpnConfigs,
+    installTunnelblick
+  } from '$lib/stores/vpn';
+  import { vpnImport } from '$lib/ipc/commands';
   import { t } from '$lib/i18n';
 
   let {
@@ -52,6 +62,9 @@
   onMount(() => {
     (mode === 'add' ? nameEl : hostnameEl)?.focus();
     void loadDefaultKey();
+    void loadVpnStatus().then((s) => {
+      if (s?.installed) void loadVpnConfigs();
+    });
     if (mode === 'edit' && previousName) {
       void hostAuth(previousName)
         .then((auth) => {
@@ -66,6 +79,29 @@
   const emptyKeyLabel = $derived(
     $defaultKey ? $t('keys.defaultIs', { name: keyFileName($defaultKey) }) : $t('keys.none')
   );
+
+  // The chosen configuration stays listed even if Tunnelblick no longer has it.
+  const vpnOptions = $derived(
+    fields.vpn && !$vpnConfigs.includes(fields.vpn) ? [...$vpnConfigs, fields.vpn] : $vpnConfigs
+  );
+  let vpnImported = $state(false);
+
+  async function importVpn(): Promise<void> {
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const picked = await open({
+        title: $t('vpn.importTitle'),
+        multiple: false,
+        directory: false,
+        filters: [{ name: 'OpenVPN', extensions: ['ovpn', 'conf', 'tblk'] }]
+      });
+      if (typeof picked !== 'string' || !picked) return;
+      await vpnImport(picked);
+      vpnImported = true;
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
 
   async function save(): Promise<void> {
     const result = formToInput(fields);
@@ -141,6 +177,75 @@
         <label for="host-key-browse">{$t('host.key')}</label>
         <KeyPicker bind:value={fields.identityFile} emptyLabel={emptyKeyLabel} id="host-key-browse" />
       </div>
+
+      {#if $vpn?.supported || fields.vpn}
+        <div class={label}>
+          <span>{$t('vpn.label')}</span>
+          {#if !$vpn?.supported}
+            <p class="text-xs font-normal text-faint">{$t('vpn.unsupported')}</p>
+          {:else if !$vpn.installed}
+            <div class="flex items-center justify-between gap-3 rounded-lg bg-surface-inset px-3 py-2">
+              <span class="text-xs font-normal text-muted">
+                {#if $vpnInstallState.stage === 'downloading'}
+                  {$t('vpn.stage.downloading', { percent: $vpnInstallState.percent })}
+                {:else if $vpnInstallState.stage === 'verifying'}
+                  {$t('vpn.stage.verifying')}
+                {:else if $vpnInstallState.stage === 'installing'}
+                  {$t('vpn.stage.installing')}
+                {:else if $vpnInstallState.stage === 'failed'}
+                  {$t('vpn.stage.failed', { error: $vpnInstallState.error })}
+                {:else}
+                  {$t('vpn.notInstalled')}
+                {/if}
+              </span>
+              <button
+                type="button"
+                class="shrink-0 rounded-full bg-accent px-3 py-1 text-xs font-medium text-accent-fg transition hover:opacity-90 disabled:opacity-50"
+                disabled={!['idle', 'failed'].includes($vpnInstallState.stage)}
+                onclick={() => void installTunnelblick().then(() => loadVpnConfigs())}
+              >
+                {$t('vpn.install')}
+              </button>
+            </div>
+          {:else}
+            <div class="flex items-center gap-2">
+              <div class="min-w-0 flex-1">
+                <Select bind:value={fields.vpn} class={field}>
+                  <option value="">{$t('vpn.none')}</option>
+                  {#each vpnOptions as name (name)}
+                    <option value={name}>{name}</option>
+                  {/each}
+                </Select>
+              </div>
+              <button
+                type="button"
+                class="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-default text-muted transition hover:border-strong hover:text-fg"
+                title={$t('vpn.refresh')}
+                aria-label={$t('vpn.refresh')}
+                onclick={() => void loadVpnConfigs()}
+              >
+                <Icon name="refresh" size={14} />
+              </button>
+              <button
+                type="button"
+                class="shrink-0 rounded-lg border border-default px-2.5 py-2 text-xs text-muted transition hover:border-strong hover:text-fg"
+                onclick={() => void importVpn()}
+              >
+                {$t('vpn.import')}
+              </button>
+            </div>
+            {#if $vpnConfigsError}
+              <p class="text-[11px] font-normal text-status-crit">
+                {$t('vpn.listFailed', { error: $vpnConfigsError })}
+              </p>
+            {:else}
+              <p class="text-[11px] font-normal text-faint">
+                {vpnImported ? $t('vpn.importDone') : $t('vpn.hint')}
+              </p>
+            {/if}
+          {/if}
+        </div>
+      {/if}
 
       <label class={label}>
         <span>{$t('host.password')}</span>

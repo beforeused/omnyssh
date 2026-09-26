@@ -73,6 +73,9 @@ pub struct HostDto {
     pub monitoring: MonitorModeDto,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor_port: Option<u16>,
+    /// Tunnelblick configuration brought up before connecting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vpn: Option<String>,
 }
 
 /// Inbound host form payload for `save_host` (tech-gui.md §4.1, Stage 4.1). Always
@@ -107,6 +110,9 @@ pub struct HostInputDto {
     pub monitoring: Option<MonitorModeDto>,
     #[serde(default)]
     pub monitor_port: Option<u16>,
+    /// Tunnelblick configuration to bring up first; absent means none.
+    #[serde(default)]
+    pub vpn: Option<String>,
 }
 
 /// Live connection state for a host (tech-gui.md §4.1). Internally tagged so the
@@ -217,6 +223,14 @@ pub struct FileEntryDto {
     pub path: String,
     pub size: u64,
     pub is_dir: bool,
+    /// Last modification, seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<u64>,
+    /// Permission bits (`0o7777` mask).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_link: bool,
 }
 
 /// Which way a transfer moves bytes.
@@ -335,6 +349,8 @@ impl From<&TransferSpec> for TransferItemDto {
 pub enum TransferStateDto {
     Queued,
     Running,
+    /// The connection dropped; resuming once it is back.
+    Reconnecting,
     Done,
     Failed,
     Cancelled,
@@ -357,6 +373,7 @@ impl From<&TransferUpdate> for TransferUpdateDto {
         let (state, error) = match &u.state {
             TransferState::Queued => (TransferStateDto::Queued, None),
             TransferState::Running => (TransferStateDto::Running, None),
+            TransferState::Reconnecting => (TransferStateDto::Reconnecting, None),
             TransferState::Done => (TransferStateDto::Done, None),
             TransferState::Failed(e) => (TransferStateDto::Failed, Some(e.clone())),
             TransferState::Cancelled => (TransferStateDto::Cancelled, None),
@@ -548,6 +565,7 @@ impl From<&Host> for HostDto {
             password_auth_disabled: host.password_auth_disabled,
             monitoring: host.monitoring.into(),
             monitor_port: host.monitor_port,
+            vpn: host.vpn.clone(),
         }
     }
 }
@@ -584,6 +602,7 @@ impl From<HostInputDto> for Host {
                 .filter(|&p| p != 0 && monitoring == MonitorMode::TcpPort),
             key_setup_date: None,
             password_auth_disabled: None,
+            vpn: non_empty(dto.vpn.map(|v| v.trim().to_string())),
         }
     }
 }
@@ -714,6 +733,9 @@ impl From<&FileEntry> for FileEntryDto {
             path: entry.path.clone(),
             size: entry.size,
             is_dir: entry.is_dir,
+            modified: entry.modified,
+            permissions: entry.permissions,
+            is_link: entry.is_link,
         }
     }
 }
@@ -841,6 +863,7 @@ mod tests {
             notes: Some("primary".to_string()),
             monitoring: None,
             monitor_port: None,
+            vpn: None,
         }
     }
 
@@ -895,6 +918,7 @@ mod tests {
             notes: Some(String::new()),
             monitoring: None,
             monitor_port: None,
+            vpn: None,
         });
         assert!(host.identity_file.is_none());
         assert!(host.password.is_none());
@@ -1103,6 +1127,7 @@ mod tests {
             path: "/etc/omnyssh/config.toml".to_string(),
             size: 4096,
             is_dir: false,
+            ..Default::default()
         };
         let dto = FileEntryDto::from(&file);
         assert_eq!(dto.name, "config.toml");
@@ -1115,6 +1140,7 @@ mod tests {
             path: "/etc".to_string(),
             size: 0,
             is_dir: true,
+            ..Default::default()
         };
         let dto = FileEntryDto::from(&dir);
         assert!(dto.is_dir);
@@ -1130,6 +1156,7 @@ mod tests {
             path: "/srv".to_string(),
             size: 0,
             is_dir: true,
+            ..Default::default()
         }))
         .expect("serialise FileEntryDto");
         assert_eq!(
@@ -1245,4 +1272,143 @@ mod tests {
         let system: EditorDto = serde_json::from_str(r#"{"kind":"system"}"#).unwrap();
         assert!(matches!(system, EditorDto::System));
     }
+}
+
+// ---------------------------------------------------------------------------
+// File manager, Docker, VPN
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ArchiveFormatDto {
+    TarGz,
+    Zip,
+}
+
+/// A file operation on the server that SFTP has no verb for.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RemoteFsOpDto {
+    /// Delete files and folders (recursively).
+    Delete {
+        paths: Vec<String>,
+    },
+    /// Pack entries of `dir` into `dir/archive`.
+    Compress {
+        dir: String,
+        names: Vec<String>,
+        archive: String,
+        format: ArchiveFormatDto,
+    },
+    Extract {
+        archive: String,
+        dest: String,
+    },
+    Chmod {
+        paths: Vec<String>,
+        mode: u32,
+        recursive: bool,
+    },
+    NewFile {
+        path: String,
+    },
+    Copy {
+        paths: Vec<String>,
+        dest: String,
+    },
+    Move {
+        paths: Vec<String>,
+        dest: String,
+    },
+}
+
+/// A file operation on this machine.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LocalFsOpDto {
+    Mkdir {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    /// Move to the Trash (recoverable).
+    Trash {
+        paths: Vec<String>,
+    },
+    NewFile {
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerDto {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub state: String,
+    pub status: String,
+    pub ports: String,
+    pub created: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+}
+
+impl From<&omnyssh_core::ssh::docker::Container> for ContainerDto {
+    fn from(c: &omnyssh_core::ssh::docker::Container) -> Self {
+        Self {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            image: c.image.clone(),
+            state: c.state.clone(),
+            status: c.status.clone(),
+            ports: c.ports.clone(),
+            created: c.created.clone(),
+            cpu: c.cpu.clone(),
+            memory: c.memory.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerListDto {
+    pub containers: Vec<ContainerDto>,
+    /// The login user needed `sudo` for docker (exec shells need it too).
+    pub sudo: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum DockerActionDto {
+    Start,
+    Stop,
+    Restart,
+    Pause,
+    Unpause,
+    Remove,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct VpnStatusDto {
+    /// Tunnelblick can be used on this OS (macOS).
+    pub supported: bool,
+    pub installed: bool,
+    /// The Tunnelblick release the app installs.
+    pub installs_version: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum VpnInstallStageDto {
+    Downloading,
+    Verifying,
+    Installing,
+    Done,
+    Failed,
 }

@@ -114,5 +114,40 @@
     <polyline points="18 15 12 9 6 15" />
   {:else if name === 'chevron-down'}
     <polyline points="6 9 12 15 18 9" />
+  {:else if name === 'docker'}
+    <path d="M21 8.5 12 4 3 8.5v7L12 20l9-4.5z" />
+    <polyline points="3 8.5 12 13 21 8.5" />
+    <line x1="12" y1="13" x2="12" y2="20" />
+  {:else if name === 'bookmark'}
+    <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+  {:else if name === 'eye-off'}
+    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+    <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+    <line x1="1" y1="1" x2="23" y2="23" />
+  {:else if name === 'lock'}
+    <rect x="4" y="11" width="16" height="10" rx="2" />
+    <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+  {:else if name === 'arrow-up'}
+    <line x1="12" y1="19" x2="12" y2="5" />
+    <polyline points="5 12 12 5 19 12" />
+  {:else if name === 'archive'}
+    <rect x="3" y="4" width="18" height="4" rx="1" />
+    <path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8" />
+    <line x1="10" y1="12" x2="14" y2="12" />
+  {:else if name === 'copy'}
+    <rect x="9" y="9" width="12" height="12" rx="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  {:else if name === 'stop'}
+    <rect x="6" y="6" width="12" height="12" rx="1" />
+  {:else if name === 'pause'}
+    <line x1="9" y1="6" x2="9" y2="18" />
+    <line x1="15" y1="6" x2="15" y2="18" />
+  {:else if name === 'list'}
+    <line x1="8" y1="6" x2="21" y2="6" />
+    <line x1="8" y1="12" x2="21" y2="12" />
+    <line x1="8" y1="18" x2="21" y2="18" />
+    <line x1="3" y1="6" x2="3.01" y2="6" />
+    <line x1="3" y1="12" x2="3.01" y2="12" />
+    <line x1="3" y1="18" x2="3.01" y2="18" />
   {/if}
 </svg>

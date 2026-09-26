@@ -10,3 +10,4 @@ pub mod event;
 pub mod ssh;
 pub mod update;
 pub mod utils;
+pub mod vpn;

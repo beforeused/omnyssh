@@ -24,7 +24,8 @@ import {
   applySnippetResult,
   applyTerminalExited,
   applyTransfersUpdated,
-  applyEditSync
+  applyEditSync,
+  applyVpnInstallProgress
 } from './router';
 
 export async function startEventBridge(): Promise<() => void> {
@@ -44,6 +45,7 @@ export async function startEventBridge(): Promise<() => void> {
     offs.push(await events.filePreview.listen((e) => applyFilePreview(e.payload)));
     offs.push(await events.transfersUpdated.listen((e) => applyTransfersUpdated(e.payload)));
     offs.push(await events.editSync.listen((e) => applyEditSync(e.payload)));
+    offs.push(await events.vpnInstallProgress.listen((e) => applyVpnInstallProgress(e.payload)));
     offs.push(await events.keySetupProgress.listen((e) => applyKeySetupProgress(e.payload)));
     offs.push(await events.keySetupComplete.listen((e) => applyKeySetupComplete(e.payload)));
     offs.push(await events.keySetupFailed.listen((e) => applyKeySetupFailed(e.payload)));

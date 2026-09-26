@@ -27,6 +27,8 @@ async function boot(page: Page): Promise<void> {
       const batches: Record<number, { direction: 'upload' | 'download'; sources: string[]; destDir: string }> = {};
       const transfersLog: Array<{ id: number; direction: string; name: string }> = [];
       const opened: Array<{ cmd: string; path: string }> = [];
+      const fsOps: Array<{ cmd: string; op: unknown }> = [];
+      (win as { __fsOps?: unknown }).__fsOps = fsOps;
       (win as { __opened?: unknown }).__opened = opened;
       (win as { __fire?: unknown }).__fire = (event: string, payload: unknown) => fireEvent(event, payload);
 
@@ -39,8 +41,10 @@ async function boot(page: Page): Promise<void> {
       };
       const remote: Record<string, Entry[]> = {
         '/': [
-          { name: 'config.yml', path: '/config.yml', size: 64, isDir: false },
-          { name: 'var', path: '/var', size: 0, isDir: true }
+          { name: 'config.yml', path: '/config.yml', size: 64, isDir: false, modified: 1700000000, permissions: 0o644 },
+          { name: 'var', path: '/var', size: 0, isDir: true, modified: 1600000000, permissions: 0o755 },
+          { name: '.env', path: '/.env', size: 12, isDir: false, modified: 1650000000, permissions: 0o600 },
+          { name: 'big.iso', path: '/big.iso', size: 900000, isDir: false, modified: 1500000000, permissions: 0o644 }
         ]
       };
 
@@ -173,6 +177,10 @@ async function boot(page: Page): Promise<void> {
               });
               return Promise.resolve(items);
             }
+            case 'remote_fs_op':
+            case 'local_fs_op':
+              fsOps.push({ cmd, op: args.op });
+              return Promise.resolve(null);
             case 'edit_confirm_upload':
               opened.push({ cmd, path: `${args.remotePath}:${args.upload}` });
               return Promise.resolve(null);
@@ -246,7 +254,7 @@ test('round-trip: upload a local file to the remote, then download a remote file
 
   // The panes stay usable while it runs: browse into a remote folder and back.
   await remotePane.getByRole('option', { name: 'var' }).dblclick();
-  await expect(remotePane.getByText('/var')).toBeVisible();
+  await expect(remotePane.getByTitle('/var', { exact: true })).toBeVisible();
   await remotePane.getByRole('option', { name: '..' }).click();
   await expect(remotePane.getByText('config.yml')).toBeVisible();
 
@@ -348,7 +356,7 @@ test('an inactive tab’s modal never overlays another entity (§2 exactly-one-a
 
   // Open db-1's New-folder modal. The modal scrim traps the sidebar, so the ⌘K
   // navigator is the reachable way to switch entity while a modal is open.
-  await page.getByRole('button', { name: 'Folder' }).click();
+  await page.getByRole('button', { name: 'Folder', exact: true }).click();
   await expect(page.getByRole('dialog', { name: 'New folder' })).toBeVisible();
   await page.keyboard.press('Control+k');
   const palette = page.getByRole('dialog', { name: 'Command palette' });
@@ -412,4 +420,84 @@ test('a terminal docks under the SFTP panes', async ({ page }) => {
   await expect(dock).toBeVisible();
   await dock.getByRole('button', { name: 'Close terminal' }).click();
   await expect(page.getByRole('region', { name: 'Terminal' })).toHaveCount(0);
+});
+
+test('file manager: filter, hidden files, sorting, path bar and bookmarks', async ({ page }) => {
+  await boot(page);
+  await page.getByTitle('files on web-1').click();
+  const remote = page.getByRole('region', { name: 'web-1' });
+  await expect(remote.getByRole('option', { name: 'config.yml' })).toBeVisible();
+
+  // Filter narrows the listing; Escape clears it.
+  const filter = remote.getByRole('textbox', { name: 'Filter this folder' });
+  await filter.fill('conf');
+  await expect(remote.getByRole('option', { name: 'big.iso' })).toHaveCount(0);
+  await filter.press('Escape');
+  await expect(remote.getByRole('option', { name: 'big.iso' })).toBeVisible();
+
+  // Hidden files toggle.
+  await expect(remote.getByRole('option', { name: '.env' })).toBeVisible();
+  await remote.getByRole('button', { name: 'Hide hidden files' }).click();
+  await expect(remote.getByRole('option', { name: '.env' })).toHaveCount(0);
+  await remote.getByRole('button', { name: 'Show hidden files' }).click();
+
+  // Sort by size: biggest file first (folders stay on top).
+  await remote.getByRole('button', { name: /^Size/ }).click();
+  const names = await remote.getByRole('option').allTextContents();
+  expect(names.map((n) => n.trim().split(/\s/)[0]).slice(0, 3)).toEqual(['var', 'big.iso', 'config.yml']);
+
+  // Typing a path navigates; the breadcrumb goes back.
+  await remote.getByTitle('Type a path').click();
+  await remote.getByRole('textbox', { name: 'Path' }).fill('/var');
+  await remote.getByRole('textbox', { name: 'Path' }).press('Enter');
+  await expect(remote.getByTitle('/var', { exact: true })).toBeVisible();
+
+  // Bookmark /var, go to /, reopen /var from the bookmarks list.
+  await remote.getByRole('button', { name: 'Bookmark this folder' }).click();
+  await remote.getByTitle('/', { exact: true }).click();
+  await expect(remote.getByRole('option', { name: 'config.yml' })).toBeVisible();
+  await remote.getByRole('button', { name: 'Bookmarks' }).click();
+  await page.getByRole('menuitem', { name: '/var' }).click();
+  await expect(remote.getByTitle('/var', { exact: true })).toBeVisible();
+});
+
+test('file manager: delete asks first, permissions and compress run on the server', async ({ page }) => {
+  await boot(page);
+  await page.getByTitle('files on web-1').click();
+  const remote = page.getByRole('region', { name: 'web-1' });
+  await expect(remote.getByRole('option', { name: 'var' })).toBeVisible();
+  const ops = () => page.evaluate(() => (window as unknown as { __fsOps: unknown[] }).__fsOps);
+
+  // Delete a folder: a confirmation, then one recursive delete.
+  await remote.getByRole('option', { name: 'var' }).click({ button: 'right' });
+  await page.getByRole('menuitem', { name: 'Delete' }).click();
+  const confirm = page.getByRole('dialog', { name: 'Delete from the server?' });
+  await expect(confirm).toBeVisible();
+  await confirm.getByRole('button', { name: 'Delete' }).click();
+  await expect.poll(ops).toContainEqual({ cmd: 'remote_fs_op', op: { kind: 'delete', paths: ['/var'] } });
+
+  // Permissions: tick group write, apply recursively.
+  await remote.getByRole('option', { name: 'var' }).click({ button: 'right' });
+  await page.getByRole('menuitem', { name: 'Permissions…' }).click();
+  const perms = page.getByRole('dialog', { name: 'Permissions' });
+  await perms.getByRole('checkbox', { name: 'Group — Write' }).check();
+  await expect(perms.getByRole('textbox')).toHaveValue('775');
+  await perms.getByText('Apply to everything inside folders').click();
+  await perms.getByRole('button', { name: 'Apply' }).click();
+  await expect.poll(ops).toContainEqual({
+    cmd: 'remote_fs_op',
+    op: { kind: 'chmod', paths: ['/var'], mode: 0o775, recursive: true }
+  });
+
+  // Compress to zip.
+  await remote.getByRole('option', { name: 'config.yml' }).click({ button: 'right' });
+  await page.getByRole('menuitem', { name: 'Compress…' }).click();
+  const zip = page.getByRole('dialog', { name: 'Compress' });
+  await zip.getByRole('button', { name: '.zip' }).click();
+  await expect(zip.getByRole('textbox')).toHaveValue('config.yml.zip');
+  await zip.getByRole('button', { name: 'Apply' }).click();
+  await expect.poll(ops).toContainEqual({
+    cmd: 'remote_fs_op',
+    op: { kind: 'compress', dir: '/', names: ['config.yml'], archive: 'config.yml.zip', format: 'zip' }
+  });
 });

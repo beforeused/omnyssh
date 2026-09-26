@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dto::{
     ConnectionStatusDto, EditSyncStateDto, FileEntryDto, HostDto, KeySetupStepDto, MetricsDto,
-    ServiceDto, TransferUpdateDto, UpdateInfoDto,
+    ServiceDto, TransferUpdateDto, UpdateInfoDto, VpnInstallStageDto,
 };
 
 /// Full host list broadcast. Emitted by `reload_hosts` after refreshing the
@@ -195,4 +195,15 @@ pub struct UpdateAvailable {
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
 pub struct Error {
     pub message: String,
+}
+
+/// Progress of installing Tunnelblick (`vpn_install`).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct VpnInstallProgress {
+    pub stage: VpnInstallStageDto,
+    pub done: u64,
+    pub total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }

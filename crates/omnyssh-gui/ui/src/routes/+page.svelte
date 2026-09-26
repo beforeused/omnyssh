@@ -15,6 +15,7 @@
   import Settings from '$lib/screens/Settings.svelte';
   import TerminalView from '$lib/screens/TerminalView.svelte';
   import SftpView from '$lib/screens/SftpView.svelte';
+  import DockerView from '$lib/screens/DockerView.svelte';
 
   onMount(async () => {
     try {
@@ -39,6 +40,8 @@
     {#each $sessions as s (s.id)}
       {#if s.kind === 'terminal'}
         <TerminalView session={s} active={activeSessionId === s.id} />
+      {:else if s.kind === 'docker'}
+        <DockerView session={s} active={activeSessionId === s.id} />
       {:else}
         <SftpView session={s} active={activeSessionId === s.id} />
       {/if}

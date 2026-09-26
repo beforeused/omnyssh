@@ -38,6 +38,7 @@ fn poller_inputs_changed(before: &Host, after: &Host) -> bool {
         || before.identity_file != after.identity_file
         || before.password != after.password
         || before.proxy_jump != after.proxy_jump
+        || before.vpn != after.vpn
         || before.original_ssh_host != after.original_ssh_host
         || before.monitoring != after.monitoring
         || before.monitor_port != after.monitor_port
@@ -227,6 +228,7 @@ impl HostForm {
             monitor_port,
             key_setup_date: None,
             password_auth_disabled: None,
+            vpn: None,
         })
     }
 
@@ -506,6 +508,8 @@ impl App {
                         // an imported host would otherwise drop its bastion and
                         // the saved copy would try to connect direct.
                         host.proxy_jump = old_host.and_then(|h| h.proxy_jump.clone());
+                        // Same for the desktop app's VPN (Tunnelblick) setting.
+                        host.vpn = old_host.and_then(|h| h.vpn.clone());
 
                         // An import is adopted under the name it was imported by; a copy
                         // already adopted keeps the one it carries. Dropping it brings the

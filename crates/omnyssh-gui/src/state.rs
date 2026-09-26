@@ -12,6 +12,7 @@ use omnyssh_core::event::{CoreEvent, SessionId};
 use omnyssh_core::ssh::client::Host;
 use omnyssh_core::ssh::pool::PollManager;
 use omnyssh_core::ssh::pty::PtyManager;
+use omnyssh_core::ssh::session::SshSession;
 use omnyssh_core::ssh::sftp::{SftpCommand, SftpManager};
 use omnyssh_core::ssh::transfer::{TransferEngine, DEFAULT_STREAMS, MAX_STREAMS};
 use tauri::ipc::Channel;
@@ -90,6 +91,8 @@ pub struct GuiState {
     transfer_streams: Arc<AtomicUsize>,
     /// Remote files open in an external editor, per SFTP tab.
     edits: Mutex<HashMap<SessionId, Arc<EditWatcher>>>,
+    /// One SSH connection per host for the Docker panel, reused across refreshes.
+    docker_sessions: tokio::sync::Mutex<HashMap<String, SshSession>>,
     /// One-shot latch so the startup update check fires once, on the frontend's first
     /// `reload_hosts` — i.e. only after its event bridge is listening (§3.4).
     update_check_started: AtomicBool,
@@ -114,6 +117,7 @@ impl GuiState {
             transfers: Mutex::new(HashMap::new()),
             transfer_streams: Arc::new(AtomicUsize::new(DEFAULT_STREAMS)),
             edits: Mutex::new(HashMap::new()),
+            docker_sessions: tokio::sync::Mutex::new(HashMap::new()),
             update_check_started: AtomicBool::new(false),
             key_setup: Mutex::new(None),
             sessions: Mutex::new(SessionRegistry::default()),
@@ -363,6 +367,31 @@ impl GuiState {
         {
             manager.send(cmd);
         }
+    }
+
+    /// The browsing SSH connection of a live SFTP tab (for exec-based file ops).
+    pub fn sftp_ssh(&self, session_id: SessionId) -> Option<SshSession> {
+        self.sftp
+            .lock()
+            .expect("sftp lock poisoned")
+            .get(&session_id)
+            .map(SftpManager::ssh_session)
+    }
+
+    /// A live SSH connection to `host` for the Docker panel: the cached one while
+    /// it is up, else a fresh one.
+    pub async fn docker_session(&self, host: &Host) -> Result<SshSession, String> {
+        let mut cache = self.docker_sessions.lock().await;
+        if let Some(s) = cache.get(&host.name) {
+            if !s.is_closed() {
+                return Ok(s.clone());
+            }
+        }
+        let session = SshSession::connect(host)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        cache.insert(host.name.clone(), session.clone());
+        Ok(session)
     }
 
     /// The transfer engine of a live SFTP tab.

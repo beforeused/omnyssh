@@ -10,6 +10,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## Unreleased
 
 ### Features
+- **Interrupted transfers resume.** When the connection to the server drops in the middle of a transfer, the queue shows *Reconnecting…*, the app reconnects on its own (waiting 1, 2, 4… up to 30 seconds between tries) and each file continues from the last byte that safely arrived instead of starting over. A dropped connection is noticed within a fraction of a second instead of after a two-minute timeout. A transfer gives up only after 12 reconnects in a row fail. Tested with a proxy that cut the connection every few seconds: every file arrived complete, with a matching checksum.
+- **OpenVPN through Tunnelblick (macOS).** A server can be set to go through a Tunnelblick VPN configuration: pick one in the server form, or import an `.ovpn` file there. The VPN comes up before the app connects — for the terminal, SFTP, Docker and key setup — and the app waits until it is connected. Background monitoring never brings a VPN up on its own. VPNs the app started are disconnected when it quits. Cards show a VPN badge.
+  - If Tunnelblick is not installed, a banner at launch offers to install it. The Install button downloads Tunnelblick 9.0.1 from tunnelblick.net (GitHub as a fallback), checks it against the published SHA-256, copies it into Applications and opens it to finish its own setup. "Don't ask again" hides the banner; the server form still offers the install.
+- **A Docker panel.** When the server has Docker, its card gets a `docker` button that opens a tab with its containers: state, image, ports, CPU and memory, refreshed every 5 seconds. Start, stop, restart, pause/resume and remove (after a confirmation) are one click. Logs open in a window with a line count and a *Follow* mode. *Shell* opens a terminal tab already inside the container (`bash`, or `sh` if it has none). If the user cannot use Docker directly, the app uses `sudo` when that works without a password.
+- **The SFTP browser is a real file manager.**
+  - Columns for name, size and modification time; click a header to sort, folders stay first.
+  - A breadcrumb path you can click, or type into (Cmd+L); an Up button and Backspace to go up.
+  - A filter box for the current folder, a toggle for hidden files, and bookmarked folders (per server, and for your own computer).
+  - On the server: new file, copy to / move to another folder, delete (asks first — it cannot be undone), permissions (checkboxes or a number, optionally for everything inside), compress to `.tar.gz` or `.zip`, extract archives in place (`.tar` in any compression, `.zip`, `.gz`), copy the path.
+  - On your computer: new file and folder, rename, *Show in Finder*, and delete moves the files to the Trash.
+  - Keys: Delete, F2 to rename, F5 to refresh, Enter to open, Cmd+A to select all.
+
+---
+
+## 1.1.2-fork.1 — 2026-09-25
+
+### Features
 - **SFTP transfers run in the background, and much faster.** Uploads and downloads used to go through the same single connection as browsing, one file after another, waiting a full round trip for every 64 KB — on a server 50 ms away that capped a transfer near 1 MB/s, and opening a folder had to wait until the current file finished. Transfers now have their own connections to the server (4 by default, 1–8 in Settings → Files) and keep megabytes of requests in flight instead of one. Large files are split across connections, and small files move many at a time. Measured against OpenSSH at 50 ms round-trip time, a 300 MB upload went from about 1 MB/s to about 170 MB/s, a download to about 400 MB/s, and 300 small files take under two seconds. Browsing never waits for a transfer.
   - A queue under the panes shows every transfer with its progress and speed, plus the overall progress and time left. Each transfer can be cancelled or retried, and closing a tab with transfers still running asks first.
   - Whole folders can be uploaded and downloaded, not just single files.

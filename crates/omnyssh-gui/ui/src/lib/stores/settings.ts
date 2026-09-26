@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import type { EditorDto } from '$lib/bindings';
 
 // The metric auto-refresh interval, in seconds (tech-gui.md §4.3). A UI preference —
@@ -122,7 +122,8 @@ export function createPref<T>(localKey: string, storeKey: string, fallback: T, c
   }
 
   const initial = mirrored();
-  const { subscribe, set: setStore } = writable<T>(initial);
+  const store = writable<T>(initial);
+  const { subscribe, set: setStore } = store;
   let interacted = false;
 
   function apply(value: T, user: boolean): void {
@@ -151,6 +152,7 @@ export function createPref<T>(localKey: string, storeKey: string, fallback: T, c
   return {
     subscribe,
     set: (value: T) => apply(value, true),
+    update: (fn: (current: T) => T) => apply(fn(get(store)), true),
     async hydrate(): Promise<void> {
       try {
         const { load } = await import('@tauri-apps/plugin-store');
@@ -199,3 +201,46 @@ export const transferStreams = createPref<number>(
   DEFAULT_STREAMS,
   clampStreams
 );
+
+// ---------------------------------------------------------------------------
+// File manager: hidden files, sort order, bookmarks
+// ---------------------------------------------------------------------------
+
+export const showHidden = createPref<boolean>('omnyssh-show-hidden', 'showHidden', true, (raw) =>
+  typeof raw === 'boolean' ? raw : true
+);
+
+export const fileSort = createPref<{ key: 'name' | 'size' | 'modified'; dir: 'asc' | 'desc' }>(
+  'omnyssh-file-sort',
+  'fileSort',
+  { key: 'name', dir: 'asc' },
+  (raw) => {
+    const r = (raw ?? {}) as Record<string, unknown>;
+    const key = r.key === 'size' || r.key === 'modified' ? r.key : 'name';
+    const dir = r.dir === 'desc' ? 'desc' : 'asc';
+    return { key, dir };
+  }
+);
+
+/** Bookmarked folders, keyed `local` or `remote:<host>`. */
+export const bookmarks = createPref<Record<string, string[]>>(
+  'omnyssh-bookmarks',
+  'bookmarks',
+  {},
+  (raw) => {
+    if (!raw || typeof raw !== 'object') return {};
+    const out: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (Array.isArray(v)) out[k] = v.filter((p): p is string => typeof p === 'string').slice(0, 50);
+    }
+    return out;
+  }
+);
+
+export function toggleBookmark(key: string, path: string): void {
+  bookmarks.update((all) => {
+    const list = all[key] ?? [];
+    const next = list.includes(path) ? list.filter((p) => p !== path) : [...list, path];
+    return { ...all, [key]: next };
+  });
+}

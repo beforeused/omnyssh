@@ -23,7 +23,7 @@ import {
 // their own store (transfers.test.ts).
 
 function entry(name: string, isDir = false, size = 0): FileEntryDto {
-  return { name, path: `/srv/${name}`, size, isDir };
+  return { name, path: `/srv/${name}`, size, isDir, isLink: false };
 }
 
 function paneWith(entries: FileEntryDto[], marked: string[] = []): Pane {
@@ -59,7 +59,7 @@ describe('sftp reducers', () => {
 
   it('selectOnly / selectRange / selectAll follow file-manager conventions', () => {
     let pane = paneWith([
-      { name: '..', path: '/', size: 0, isDir: true },
+      { name: '..', path: '/', size: 0, isDir: true, isLink: false },
       entry('a'),
       entry('b'),
       entry('c'),

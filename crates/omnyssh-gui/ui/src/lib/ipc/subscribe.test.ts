@@ -30,6 +30,7 @@ vi.mock('$lib/bindings', () => {
       filePreview: channel('filePreview'),
       transfersUpdated: channel('transfersUpdated'),
       editSync: channel('editSync'),
+      vpnInstallProgress: channel('vpnInstallProgress'),
       keySetupProgress: channel('keySetupProgress'),
       keySetupComplete: channel('keySetupComplete'),
       keySetupFailed: channel('keySetupFailed'),

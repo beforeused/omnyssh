@@ -189,6 +189,7 @@ mod tests {
             notes: None,
             monitoring: None,
             monitor_port: None,
+            vpn: None,
         }
     }
 
@@ -402,6 +403,7 @@ mod clear_identity_tests {
             notes: None,
             monitoring: None,
             monitor_port: None,
+            vpn: None,
         };
         upsert(&mut hosts, input.clone(), None);
         assert_eq!(

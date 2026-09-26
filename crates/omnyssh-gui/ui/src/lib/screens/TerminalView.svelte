@@ -36,6 +36,7 @@
     <TerminalPane
       hostName={session.hostName}
       visible={active}
+      initialInput={session.initialInput}
       onOpened={opened}
       onFirstOutput={() => sessions.setStatus(session.id, 'connected')}
       onFailed={failed}

@@ -15,9 +15,11 @@ mod error;
 mod events;
 mod state;
 
+use commands::docker::{docker_action, docker_list, docker_logs, docker_shell_command};
 use commands::editor::{
     detect_editors, edit_confirm_upload, edit_remote_file, edit_resolve_conflict, open_local_file,
 };
+use commands::files::{local_fs_op, remote_fs_op};
 use commands::hosts::{delete_host, list_hosts, refresh_metrics, reload_hosts, save_host};
 use commands::keysetup::{
     get_default_key, host_auth, inspect_ssh_key, list_ssh_keys, set_default_key, start_key_setup,
@@ -33,6 +35,9 @@ use commands::transfer::{
     transfer_prepare, transfer_retry,
 };
 use commands::update::{check_update, install_update, load_update_config, save_update_config};
+use commands::vpn::{
+    vpn_configurations, vpn_connect, vpn_disconnect, vpn_import, vpn_install, vpn_state, vpn_status,
+};
 use omnyssh_core::event::{CoreEvent, SessionId};
 use omnyssh_core::ssh::pty::PtyManager;
 use state::GuiState;
@@ -129,6 +134,19 @@ fn specta_builder() -> Builder<tauri::Wry> {
             edit_remote_file,
             edit_resolve_conflict,
             edit_confirm_upload,
+            remote_fs_op,
+            local_fs_op,
+            docker_list,
+            docker_action,
+            docker_logs,
+            docker_shell_command,
+            vpn_status,
+            vpn_configurations,
+            vpn_import,
+            vpn_state,
+            vpn_connect,
+            vpn_disconnect,
+            vpn_install,
             start_key_setup,
             list_ssh_keys,
             inspect_ssh_key,
@@ -156,6 +174,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             events::FilePreview,
             events::TransfersUpdated,
             events::EditSync,
+            events::VpnInstallProgress,
             events::KeySetupProgress,
             events::KeySetupComplete,
             events::KeySetupFailed,
@@ -342,8 +361,15 @@ fn main() {
             // `UpdateAvailable` before the webview can receive them (§3.4).
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed to launch OmnySSH Desktop");
+        .build(tauri::generate_context!())
+        .expect("failed to launch OmnySSH Desktop")
+        .run(|_app, event| {
+            // VPNs the app brought up for a host go down with it; ones the user
+            // had connected already are left alone.
+            if let tauri::RunEvent::Exit = event {
+                tauri::async_runtime::block_on(omnyssh_core::vpn::disconnect_started());
+            }
+        });
 }
 
 #[cfg(test)]

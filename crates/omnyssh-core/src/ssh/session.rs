@@ -134,6 +134,36 @@ impl std::ops::Deref for SshConnection {
 // SshSession
 // ---------------------------------------------------------------------------
 
+/// What [`SshSession::run_script`] saw.
+#[derive(Debug, Clone, Default)]
+pub struct ScriptOutput {
+    pub stdout: String,
+    pub stderr: String,
+    /// The exit status, when the server reported one.
+    pub status: Option<u32>,
+}
+
+impl ScriptOutput {
+    /// Exit status 0 (or none reported).
+    pub fn ok(&self) -> bool {
+        matches!(self.status, None | Some(0))
+    }
+
+    /// The most useful error text: stderr, else stdout, else the status.
+    pub fn error_text(&self) -> String {
+        let text = if self.stderr.trim().is_empty() {
+            self.stdout.trim()
+        } else {
+            self.stderr.trim()
+        };
+        if text.is_empty() {
+            format!("exit status {}", self.status.unwrap_or(1))
+        } else {
+            text.lines().take(6).collect::<Vec<_>>().join("\n")
+        }
+    }
+}
+
 /// An authenticated SSH session ready for command execution.
 ///
 /// Holds the russh client handle for the duration of its lifetime.
@@ -184,6 +214,19 @@ impl SshSession {
         })
     }
 
+    /// Like [`SshSession::connect`], but never brings a host's VPN up: when it is
+    /// down the connect fails. For background work (metrics polling) that must
+    /// not start a VPN on its own.
+    ///
+    /// # Errors
+    /// As [`SshSession::connect`], plus a VPN that is not connected.
+    pub async fn connect_passive(host: &Host) -> anyhow::Result<Self> {
+        connect_via_vpn(host, false).await?;
+        Ok(Self {
+            handle: Arc::new(connect_hops(host, client_config(), &AuthPolicy::Any).await?),
+        })
+    }
+
     /// Like [`SshSession::connect`], tuned for bulk data: a large receive window
     /// so downloads are not throttled by flow control on high-latency links.
     ///
@@ -195,6 +238,12 @@ impl SshSession {
                 connect_and_auth_with(host, bulk_client_config(), &AuthPolicy::Any).await?,
             ),
         })
+    }
+
+    /// Whether the connection is gone (closed by either side, or dead after
+    /// unanswered keepalives).
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
     }
 
     /// Execute a shell command on the remote host and return its stdout.
@@ -223,6 +272,42 @@ impl SshSession {
             None | Some(0) => Ok(output),
             Some(code) => Err(anyhow!("remote command exited with status {code}")),
         }
+    }
+
+    /// Run `cmd` with its own time budget and keep stderr too — for file
+    /// operations (archives, recursive deletes) that can outlast the 30 s
+    /// command timeout and whose error text the user should see.
+    ///
+    /// # Errors
+    /// Channel failure or the time budget running out. A non-zero exit is not an
+    /// error here: it is reported in [`ScriptOutput::status`].
+    pub async fn run_script(&self, cmd: &str, budget: Duration) -> anyhow::Result<ScriptOutput> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open SSH channel")?;
+        channel.exec(true, cmd).await.context("exec SSH command")?;
+        time::timeout(budget, async {
+            let mut out = ScriptOutput::default();
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Data { ref data }) => stdout.extend_from_slice(data),
+                    Some(ChannelMsg::ExtendedData { ref data, .. }) => {
+                        stderr.extend_from_slice(data)
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => out.status = Some(exit_status),
+                    Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                }
+            }
+            out.stdout = String::from_utf8_lossy(&stdout).into_owned();
+            out.stderr = String::from_utf8_lossy(&stderr).into_owned();
+            out
+        })
+        .await
+        .map_err(|_| anyhow!("command timed out ({} s)", budget.as_secs()))
     }
 
     /// Opens a channel, runs `cmd`, and returns its stdout and exit status.
@@ -304,6 +389,33 @@ enum AuthPolicy {
 }
 
 async fn connect_and_auth_with(
+    host: &Host,
+    config: Arc<client::Config>,
+    policy: &AuthPolicy,
+) -> anyhow::Result<SshConnection> {
+    connect_via_vpn(host, true).await?;
+    connect_hops(host, config, policy).await
+}
+
+/// A host behind a VPN (Tunnelblick) needs it up first. `start` brings it up;
+/// without it (background polling) a VPN that is down fails the connect instead
+/// of connecting the VPN behind the user's back.
+async fn connect_via_vpn(host: &Host, start: bool) -> anyhow::Result<()> {
+    let Some(name) = host.vpn.as_deref().filter(|n| !n.trim().is_empty()) else {
+        return Ok(());
+    };
+    if start {
+        crate::vpn::ensure_up(name)
+            .await
+            .with_context(|| format!("VPN '{name}'"))
+    } else if crate::vpn::is_up(name).await {
+        Ok(())
+    } else {
+        Err(anyhow!("VPN '{name}' is not connected"))
+    }
+}
+
+async fn connect_hops(
     host: &Host,
     config: Arc<client::Config>,
     policy: &AuthPolicy,

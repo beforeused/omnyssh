@@ -19,11 +19,15 @@
   import { Icon } from '$lib/theme';
   import Modal from '$lib/components/Modal.svelte';
   import ContextMenu, { type MenuItem } from '$lib/components/ContextMenu.svelte';
-  import SftpPane, { type SelectMode } from './SftpPane.svelte';
+  import SftpPane, { type SelectMode, type PaneKey } from './SftpPane.svelte';
+  import PermissionsDialog from './PermissionsDialog.svelte';
   import TransferPanel from './TransferPanel.svelte';
   import ConflictDialog from './ConflictDialog.svelte';
   import TerminalPane from './TerminalPane.svelte';
   import type {
+    ArchiveFormatDto,
+    LocalFsOpDto,
+    RemoteFsOpDto,
     ConflictActionDto,
     ConflictResolutionDto,
     FileEntryDto,
@@ -32,9 +36,18 @@
   } from '$lib/bindings';
   import { sessions, type Session } from '$lib/stores/sessions';
   import { registerCloseGuard } from '$lib/stores/navigation';
-  import { sftp, markedEntries, type PaneSide } from '$lib/stores/sftp';
+  import {
+    sftp,
+    markedEntries,
+    viewEntries,
+    toggleSort,
+    parentPath,
+    isArchive,
+    type PaneSide,
+    type SortKey
+  } from '$lib/stores/sftp';
   import { transfers, EMPTY_QUEUE, isActive } from '$lib/stores/transfers';
-  import { editor } from '$lib/stores/settings';
+  import { editor, showHidden, fileSort, bookmarks, toggleBookmark } from '$lib/stores/settings';
   import { lastError } from '$lib/stores/notifications';
   import { onTerminalExit } from '$lib/ipc/router';
   import { t } from '$lib/i18n';
@@ -44,7 +57,6 @@
     sftpClose,
     sftpMkdir,
     sftpRename,
-    sftpDelete,
     sftpPreview,
     listLocalDir,
     previewLocalFile,
@@ -57,7 +69,9 @@
     openLocalFile,
     editRemoteFile,
     editResolveConflict,
-    editConfirmUpload
+    editConfirmUpload,
+    remoteFsOp,
+    localFsOp
   } from '$lib/ipc/commands';
 
   let { session, active }: { session: Session; active: boolean } = $props();
@@ -75,9 +89,26 @@
   let outbox = $state<Array<() => void>>([]);
 
   // A pending mkdir/rename input. Rename carries the entry being renamed.
-  let prompt = $state<{ kind: 'mkdir' | 'rename'; value: string; target?: FileEntryDto } | null>(
-    null
-  );
+  type PromptKind = 'mkdir' | 'rename' | 'newFile' | 'compress' | 'copyTo' | 'moveTo';
+  let prompt = $state<{
+    kind: PromptKind;
+    side: PaneSide;
+    value: string;
+    targets: FileEntryDto[];
+    format?: ArchiveFormatDto;
+  } | null>(null);
+  /** Remote entries waiting for "delete for good?". */
+  let confirmDelete = $state<FileEntryDto[] | null>(null);
+  /** An archive waiting for "extract here (overwrites)?". */
+  let confirmExtract = $state<FileEntryDto | null>(null);
+  /** Remote entries whose permissions are being edited. */
+  let permsFor = $state<FileEntryDto[] | null>(null);
+  /** Server-side file operations in flight. */
+  let working = $state(0);
+  /** A short note in the status strip ("Path copied"). */
+  let note = $state<string | null>(null);
+  let localFilter = $state('');
+  let remoteFilter = $state('');
 
   /** Transfer batches being walked / checked for conflicts. */
   let preparing = $state(0);
@@ -104,6 +135,39 @@
   const localMarked = $derived(view ? markedEntries(view.local) : []);
   const remoteMarked = $derived(view ? markedEntries(view.remote) : []);
   const singleRemoteMark = $derived(remoteMarked.length === 1 ? remoteMarked[0] : undefined);
+
+  // What each pane lists: hidden files and its filter applied, sorted by column.
+  const localEntries = $derived(
+    view
+      ? viewEntries(view.local.entries, { showHidden: $showHidden, filter: localFilter, sort: $fileSort })
+      : []
+  );
+  const remoteEntries = $derived(
+    view
+      ? viewEntries(view.remote.entries, { showHidden: $showHidden, filter: remoteFilter, sort: $fileSort })
+      : []
+  );
+  const bookmarkKey = (side: PaneSide): string => (side === 'local' ? 'local' : `remote:${session.hostName}`);
+  const localBookmarked = $derived(!!view && ($bookmarks.local ?? []).includes(view.local.path));
+  const remoteBookmarked = $derived(
+    !!view && ($bookmarks[`remote:${session.hostName}`] ?? []).includes(view.remote.path)
+  );
+
+  // A new folder starts unfiltered.
+  let lastLocalPath = '';
+  let lastRemotePath = '';
+  $effect(() => {
+    const lp = view?.local.path ?? '';
+    const rp = view?.remote.path ?? '';
+    if (lp !== lastLocalPath) {
+      lastLocalPath = lp;
+      localFilter = '';
+    }
+    if (rp !== lastRemotePath) {
+      lastRemotePath = rp;
+      remoteFilter = '';
+    }
+  });
   const editPrompt = $derived(view?.editPrompts[0]);
 
   function errMsg(err: unknown): string {
@@ -112,6 +176,11 @@
 
   function joinRemote(dir: string, name: string): string {
     return dir.endsWith('/') ? `${dir}${name}` : `${dir}/${name}`;
+  }
+
+  function joinLocal(dir: string, name: string): string {
+    const sep = dir.includes('\\') && !dir.includes('/') ? '\\' : '/';
+    return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`;
   }
 
   function baseName(path: string): string {
@@ -571,7 +640,7 @@
     const id = backendId;
     if (id == null) return;
     if (mode === 'toggle') sftp.toggleMark(id, side, path);
-    else if (mode === 'range') sftp.selectRange(id, side, path);
+    else if (mode === 'range') sftp.selectRange(id, side, path, side === 'local' ? localEntries : remoteEntries);
     else sftp.selectOnly(id, side, path);
   }
 
@@ -594,23 +663,73 @@
     outbox = [...outbox, ...actions];
   }
 
-  function remove(entries: FileEntryDto[] = remoteMarked): void {
-    const id = backendId;
-    if (id == null) return;
-    enqueue(
-      ...entries.map((entry) => () => {
-        sftp.pushOp(id, { kind: 'delete', name: entry.name, refresh: 'remote' });
-        void sftpDelete(id, entry.path).catch(onDispatchError(id));
-      })
-    );
+  // -- file operations -----------------------------------------------------------
+
+  function openPath(side: PaneSide, path: string): void {
+    if (side === 'local') void refreshLocal(path);
+    else refreshRemote(path);
   }
 
-  function openPrompt(kind: 'mkdir' | 'rename', target: FileEntryDto | undefined = singleRemoteMark): void {
-    if (kind === 'rename' && target) {
-      prompt = { kind, value: target.name, target };
-    } else if (kind === 'mkdir') {
-      prompt = { kind, value: '' };
+  function goUp(side: PaneSide): void {
+    if (!view) return;
+    const current = view[side].path;
+    const up = parentPath(current);
+    if (up && up !== current) openPath(side, up);
+  }
+
+  async function runRemote(op: RemoteFsOpDto): Promise<void> {
+    const id = backendId;
+    if (id == null) return;
+    working += 1;
+    try {
+      await remoteFsOp(id, op);
+    } catch (err) {
+      lastError.set(errMsg(err));
+    } finally {
+      working -= 1;
+      if (view) refreshRemote(view.remote.path);
     }
+  }
+
+  async function runLocal(op: LocalFsOpDto): Promise<void> {
+    try {
+      await localFsOp(op);
+    } catch (err) {
+      lastError.set(errMsg(err));
+    } finally {
+      if (view) void refreshLocal(view.local.path);
+    }
+  }
+
+  /** Remote: ask, then delete recursively. Local: straight to the Trash. */
+  function askDelete(side: PaneSide, entries: FileEntryDto[]): void {
+    if (!entries.length) return;
+    if (side === 'remote') confirmDelete = entries;
+    else void runLocal({ kind: 'trash', paths: entries.map((e) => e.path) });
+  }
+
+  function openPrompt(kind: PromptKind, side: PaneSide = 'remote', targets: FileEntryDto[] = []): void {
+    if (!view) return;
+    const dir = view[side].path;
+    if (kind === 'rename') {
+      const target = targets[0] ?? (side === 'remote' ? singleRemoteMark : localMarked[0]);
+      if (!target) return;
+      prompt = { kind, side, value: target.name, targets: [target] };
+    } else if (kind === 'compress') {
+      const base = targets.length === 1 ? targets[0].name : 'archive';
+      prompt = { kind, side, value: `${base}.tar.gz`, targets, format: 'tarGz' };
+    } else if (kind === 'copyTo' || kind === 'moveTo') {
+      prompt = { kind, side, value: dir, targets };
+    } else {
+      prompt = { kind, side, value: '', targets };
+    }
+  }
+
+  /** Switching the archive format swaps the name's extension along with it. */
+  function setFormat(format: ArchiveFormatDto): void {
+    if (!prompt) return;
+    const stem = prompt.value.replace(/(\.tar\.gz|\.zip)$/i, '');
+    prompt = { ...prompt, format, value: `${stem}${format === 'zip' ? '.zip' : '.tar.gz'}` };
   }
 
   function submitPrompt(): void {
@@ -618,20 +737,80 @@
     if (id == null || !view || !prompt) return;
     const value = prompt.value.trim();
     if (!value) return;
-    const dir = view.remote.path;
-    if (prompt.kind === 'mkdir') {
-      enqueue(() => {
-        sftp.pushOp(id, { kind: 'mkdir', refresh: 'remote' });
-        void sftpMkdir(id, joinRemote(dir, value)).catch(onDispatchError(id));
-      });
-    } else if (prompt.target) {
-      const from = prompt.target.path;
-      enqueue(() => {
-        sftp.pushOp(id, { kind: 'rename', refresh: 'remote' });
-        void sftpRename(id, from, joinRemote(dir, value)).catch(onDispatchError(id));
-      });
-    }
+    const { kind, side, targets, format } = prompt;
+    const dir = view[side].path;
     prompt = null;
+    if (side === 'local') {
+      if (kind === 'mkdir') void runLocal({ kind: 'mkdir', path: joinLocal(dir, value) });
+      else if (kind === 'newFile') void runLocal({ kind: 'newFile', path: joinLocal(dir, value) });
+      else if (kind === 'rename' && targets[0]) {
+        void runLocal({ kind: 'rename', from: targets[0].path, to: joinLocal(dir, value) });
+      }
+      return;
+    }
+    const paths = targets.map((t) => t.path);
+    switch (kind) {
+      case 'mkdir':
+        enqueue(() => {
+          sftp.pushOp(id, { kind: 'mkdir', refresh: 'remote' });
+          void sftpMkdir(id, joinRemote(dir, value)).catch(onDispatchError(id));
+        });
+        break;
+      case 'rename': {
+        const from = targets[0]?.path;
+        if (!from) break;
+        enqueue(() => {
+          sftp.pushOp(id, { kind: 'rename', refresh: 'remote' });
+          void sftpRename(id, from, joinRemote(dir, value)).catch(onDispatchError(id));
+        });
+        break;
+      }
+      case 'newFile':
+        void runRemote({ kind: 'newFile', path: joinRemote(dir, value) });
+        break;
+      case 'compress':
+        void runRemote({
+          kind: 'compress',
+          dir,
+          names: targets.map((t) => t.name),
+          archive: value,
+          format: format ?? (value.toLowerCase().endsWith('.zip') ? 'zip' : 'tarGz')
+        });
+        break;
+      case 'copyTo':
+        void runRemote({ kind: 'copy', paths, dest: value });
+        break;
+      case 'moveTo':
+        void runRemote({ kind: 'move', paths, dest: value });
+        break;
+    }
+  }
+
+  async function copyPaths(entries: FileEntryDto[]): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(entries.map((e) => e.path).join('\n'));
+      note = $t('fm.copied');
+      setTimeout(() => (note = null), 2000);
+    } catch (err) {
+      lastError.set(errMsg(err));
+    }
+  }
+
+  function paneKey(side: PaneSide, key: PaneKey): void {
+    if (key === 'refresh') refreshSide(side);
+    else if (key === 'delete') askDelete(side, side === 'local' ? localMarked : remoteMarked);
+    else if (key === 'rename') openPrompt('rename', side);
+  }
+
+  function showBookmarks(side: PaneSide, x: number, y: number): void {
+    const list = $bookmarks[bookmarkKey(side)] ?? [];
+    menu = {
+      x,
+      y,
+      items: list.length
+        ? list.map((path) => ({ label: path, icon: 'folder' as const, run: () => openPath(side, path) }))
+        : [{ label: $t('fm.noBookmarks'), disabled: true, run: () => {} }]
+    };
   }
 
   function closePreview(): void {
@@ -646,17 +825,21 @@
     const many = entry ? selected.length > 1 && selected.some((e) => e.path === entry.path) : false;
     const targets = entry ? (many ? selected : [entry]) : [];
     const n = targets.length;
+    const single = entry && !many ? entry : null;
     const items: MenuItem[] = [];
-    if (entry && !many) {
-      if (entry.isDir) {
-        items.push({ label: $t('sftp.menu.open'), icon: 'folder', run: () => navigate(side, entry) });
+    if (single) {
+      if (single.isDir) {
+        items.push({ label: $t('sftp.menu.open'), icon: 'folder', run: () => navigate(side, single) });
       } else {
         items.push({
           label: side === 'remote' ? $t('sftp.menu.openInEditor') : $t('sftp.menu.open'),
           icon: 'external',
-          run: () => void openEntry(side, entry)
+          run: () => void openEntry(side, single)
         });
-        items.push({ label: $t('sftp.menu.quickLook'), icon: 'eye', run: () => void preview(side, entry) });
+        items.push({ label: $t('sftp.menu.quickLook'), icon: 'eye', run: () => void preview(side, single) });
+        if (side === 'remote' && isArchive(single.name)) {
+          items.push({ label: $t('fm.extract'), icon: 'archive', run: () => (confirmExtract = single) });
+        }
       }
     }
     if (n) {
@@ -674,20 +857,49 @@
         });
       }
     }
-    if (side === 'remote') {
-      if (entry && !many) {
-        items.push({ label: $t('sftp.menu.rename'), icon: 'edit', run: () => openPrompt('rename', entry) });
-      }
-      if (n) {
+    if (single) {
+      items.push({ label: $t('sftp.menu.rename'), icon: 'edit', run: () => openPrompt('rename', side, [single]) });
+    }
+    if (side === 'remote' && n) {
+      items.push({ label: $t('fm.copyTo'), icon: 'copy', run: () => openPrompt('copyTo', side, targets) });
+      items.push({ label: $t('fm.moveTo'), icon: 'arrow-up', run: () => openPrompt('moveTo', side, targets) });
+      items.push({ label: $t('fm.compress'), icon: 'archive', run: () => openPrompt('compress', side, targets) });
+      items.push({ label: $t('fm.permissions'), icon: 'lock', run: () => (permsFor = targets) });
+    }
+    if (n) {
+      items.push({ label: $t('fm.copyPath'), icon: 'copy', run: () => void copyPaths(targets) });
+    }
+    if (side === 'local' && single) {
+      const dir = single.isDir ? single.path : parentPath(single.path);
+      items.push({
+        label: $t('fm.revealLocal'),
+        icon: 'external',
+        run: () => void openLocalFile(dir, { kind: 'system' }).catch((e) => lastError.set(errMsg(e)))
+      });
+    }
+    if (n) {
+      if (side === 'remote') {
         items.push({
           label: n > 1 ? $t('sftp.menu.deleteN', { count: n }) : $t('sftp.menu.delete'),
           icon: 'trash',
           danger: true,
-          run: () => remove(targets)
+          run: () => askDelete(side, targets)
+        });
+      } else {
+        items.push({
+          label: n > 1 ? $t('fm.trashN', { count: n }) : $t('fm.trash'),
+          icon: 'trash',
+          danger: true,
+          run: () => askDelete(side, targets)
         });
       }
-      if (!entry) items.push({ label: $t('sftp.menu.newFolder'), icon: 'plus', run: () => openPrompt('mkdir') });
-      const dir = entry?.isDir && !many ? entry.path : view.remote.path;
+    }
+    if (!entry) {
+      items.push({ label: $t('sftp.menu.newFolder'), icon: 'plus', run: () => openPrompt('mkdir', side) });
+      items.push({ label: $t('fm.newFile'), icon: 'file', run: () => openPrompt('newFile', side) });
+    }
+    if (side === 'remote') {
+      const dir = single?.isDir ? single.path : view.remote.path;
       items.push({ label: $t('sftp.menu.terminalHere'), icon: 'terminal', run: () => terminalHere(dir) });
     }
     items.push({ label: $t('common.refresh'), icon: 'refresh', run: () => refreshSide(side) });
@@ -811,13 +1023,25 @@
         title={$t('sftp.local')}
         side="local"
         pane={view.local}
+        entries={localEntries}
+        sort={$fileSort}
+        showHidden={$showHidden}
+        bind:filter={localFilter}
+        bookmarked={localBookmarked}
         dropTarget={dropTarget?.side === 'local' ? dropTarget : undefined}
         onNavigate={(e) => navigate('local', e)}
+        onOpenPath={(p) => openPath('local', p)}
+        onUp={() => goUp('local')}
         onOpen={(e) => void openEntry('local', e)}
         onSelect={(p, mode) => select('local', p, mode)}
-        onSelectAll={() => backendId != null && sftp.selectAll(backendId, 'local')}
+        onSelectAll={() => backendId != null && sftp.selectAll(backendId, 'local', localEntries)}
         onContextMenu={(e, x, y) => showMenu('local', e, x, y)}
         onRowPointerDown={(entry, e) => rowPointerDown('local', entry, e)}
+        onSort={(key: SortKey) => fileSort.set(toggleSort($fileSort, key))}
+        onToggleHidden={() => showHidden.set(!$showHidden)}
+        onToggleBookmark={() => view && toggleBookmark('local', view.local.path)}
+        onShowBookmarks={(x, y) => showBookmarks('local', x, y)}
+        onKey={(k) => paneKey('local', k)}
       >
         {#snippet toolbar()}
           <button
@@ -846,13 +1070,25 @@
         title={session.hostName}
         side="remote"
         pane={view.remote}
+        entries={remoteEntries}
+        sort={$fileSort}
+        showHidden={$showHidden}
+        bind:filter={remoteFilter}
+        bookmarked={remoteBookmarked}
         dropTarget={dropTarget?.side === 'remote' ? dropTarget : undefined}
         onNavigate={(e) => navigate('remote', e)}
+        onOpenPath={(p) => openPath('remote', p)}
+        onUp={() => goUp('remote')}
         onOpen={(e) => void openEntry('remote', e)}
         onSelect={(p, mode) => select('remote', p, mode)}
-        onSelectAll={() => backendId != null && sftp.selectAll(backendId, 'remote')}
+        onSelectAll={() => backendId != null && sftp.selectAll(backendId, 'remote', remoteEntries)}
         onContextMenu={(e, x, y) => showMenu('remote', e, x, y)}
         onRowPointerDown={(entry, e) => rowPointerDown('remote', entry, e)}
+        onSort={(key: SortKey) => fileSort.set(toggleSort($fileSort, key))}
+        onToggleHidden={() => showHidden.set(!$showHidden)}
+        onToggleBookmark={() => view && toggleBookmark(bookmarkKey('remote'), view.remote.path)}
+        onShowBookmarks={(x, y) => showBookmarks('remote', x, y)}
+        onKey={(k) => paneKey('remote', k)}
       >
         {#snippet toolbar()}
           <button
@@ -875,7 +1111,7 @@
             title={$t('sftp.renameTitle')}
             aria-label={$t('sftp.rename')}
             disabled={!singleRemoteMark}
-            onclick={() => openPrompt('rename')}
+            onclick={() => openPrompt('rename', 'remote')}
           >
             <Icon name="edit" size={13} />
           </button>
@@ -885,7 +1121,7 @@
             title={$t('sftp.delete')}
             aria-label={$t('sftp.delete')}
             disabled={remoteMarked.length === 0}
-            onclick={() => remove()}
+            onclick={() => askDelete('remote', remoteMarked)}
           >
             <Icon name="trash" size={13} />
           </button>
@@ -977,9 +1213,13 @@
       </section>
     {/if}
 
-    {#if opening || (view.edit && !editNoteHidden)}
+    {#if opening || working > 0 || note || (view.edit && !editNoteHidden)}
       <div class="shrink-0 border-t border-default px-4 py-2 text-xs" aria-live="polite">
-        {#if opening}
+        {#if working > 0}
+          <span class="text-muted">{$t('fm.working')}</span>
+        {:else if note}
+          <span class="text-status-ok">{note}</span>
+        {:else if opening}
           <span class="text-muted">{$t('sftp.opening', { name: opening })}</span>
         {:else if view.edit}
           {@const name = baseName(view.edit.path)}
@@ -1103,7 +1343,23 @@
 {/if}
 
 {#if active && prompt}
-  <Modal label={prompt.kind === 'mkdir' ? $t('sftp.newFolder') : $t('sftp.rename')} onClose={() => (prompt = null)}>
+  {@const titles = {
+    mkdir: $t('sftp.newFolder'),
+    rename: $t('sftp.renameOf', { name: prompt.targets[0]?.name ?? '' }),
+    newFile: $t('fm.newFileTitle'),
+    compress: $t('fm.compressTitle'),
+    copyTo: $t('fm.copyTo'),
+    moveTo: $t('fm.moveTo')
+  }}
+  {@const labels = {
+    mkdir: $t('sftp.folderName'),
+    rename: $t('sftp.newName'),
+    newFile: $t('fm.fileName'),
+    compress: $t('fm.archiveName'),
+    copyTo: $t('fm.destination'),
+    moveTo: $t('fm.destination')
+  }}
+  <Modal label={titles[prompt.kind]} onClose={() => (prompt = null)}>
     <form
       onsubmit={(e) => {
         e.preventDefault();
@@ -1111,19 +1367,40 @@
       }}
     >
       <header class="border-b border-default px-5 py-3.5">
-        <h2 class="text-sm font-semibold">
-          {prompt.kind === 'mkdir' ? $t('sftp.newFolder') : $t('sftp.renameOf', { name: prompt.target?.name ?? '' })}
-        </h2>
+        <h2 class="text-sm font-semibold">{titles[prompt.kind]}</h2>
+        {#if prompt.targets.length && prompt.kind !== 'rename'}
+          <p class="mt-1 truncate font-mono text-xs text-muted">
+            {prompt.targets.map((t) => t.name).join(', ')}
+          </p>
+        {/if}
       </header>
-      <div class="px-5 py-4">
+      <div class="space-y-3 px-5 py-4">
         <!-- svelte-ignore a11y_autofocus -->
         <input
           autofocus
           bind:value={prompt.value}
-          class={field}
-          placeholder={prompt.kind === 'mkdir' ? $t('sftp.folderName') : $t('sftp.newName')}
-          aria-label={prompt.kind === 'mkdir' ? $t('sftp.folderName') : $t('sftp.newName')}
+          class="{field} {prompt.kind === 'copyTo' || prompt.kind === 'moveTo' ? 'font-mono' : ''}"
+          placeholder={labels[prompt.kind]}
+          aria-label={labels[prompt.kind]}
+          spellcheck="false"
         />
+        {#if prompt.kind === 'compress'}
+          <div class="flex items-center gap-2 text-xs text-muted">
+            {$t('fm.format')}
+            {#each [['tarGz', '.tar.gz'], ['zip', '.zip']] as [fmt, label] (fmt)}
+              <button
+                type="button"
+                class="rounded-lg px-2.5 py-1 font-mono transition {prompt.format === fmt
+                  ? 'bg-accent text-accent-fg'
+                  : 'bg-surface-inset text-muted hover:text-fg'}"
+                aria-pressed={prompt.format === fmt}
+                onclick={() => setFormat(fmt as ArchiveFormatDto)}
+              >
+                {label}
+              </button>
+            {/each}
+          </div>
+        {/if}
       </div>
       <footer class="flex justify-end gap-2 border-t border-default px-5 py-3">
         <button
@@ -1138,11 +1415,92 @@
           class="rounded-full bg-accent px-5 py-2 text-sm font-medium text-accent-fg transition hover:opacity-90 disabled:opacity-50"
           disabled={!prompt.value.trim()}
         >
-          {prompt.kind === 'mkdir' ? $t('sftp.create') : $t('sftp.rename')}
+          {prompt.kind === 'rename' ? $t('sftp.rename') : prompt.kind === 'mkdir' || prompt.kind === 'newFile' ? $t('sftp.create') : $t('fm.apply')}
         </button>
       </footer>
     </form>
   </Modal>
+{/if}
+
+{#if active && confirmDelete}
+  {@const doomed = confirmDelete}
+  <Modal label={$t('fm.deleteTitle')} onClose={() => (confirmDelete = null)}>
+    <header class="border-b border-default px-5 py-3.5">
+      <h2 class="text-sm font-semibold">{$t('fm.deleteTitle')}</h2>
+      <p class="mt-1 truncate font-mono text-xs text-muted">{doomed.map((e) => e.name).join(', ')}</p>
+    </header>
+    <p class="px-5 py-4 text-sm text-muted">
+      {$t('fm.deleteBody', { count: doomed.length, host: session.hostName })}
+    </p>
+    <footer class="flex justify-end gap-2 border-t border-default px-5 py-3">
+      <button
+        type="button"
+        class="rounded-full px-4 py-2 text-sm text-muted transition hover:bg-surface-inset hover:text-fg"
+        onclick={() => (confirmDelete = null)}
+      >
+        {$t('common.cancel')}
+      </button>
+      <button
+        type="button"
+        class="rounded-full bg-accent px-5 py-2 text-sm font-medium text-accent-fg transition hover:opacity-90"
+        onclick={() => {
+          // Read before closing: `doomed` follows `confirmDelete`.
+          const paths = doomed.map((e) => e.path);
+          confirmDelete = null;
+          void runRemote({ kind: 'delete', paths });
+        }}
+      >
+        {$t('fm.deleteConfirm')}
+      </button>
+    </footer>
+  </Modal>
+{/if}
+
+{#if active && confirmExtract && view}
+  {@const archive = confirmExtract}
+  {@const dest = view.remote.path}
+  <Modal label={$t('fm.extract')} onClose={() => (confirmExtract = null)}>
+    <header class="border-b border-default px-5 py-3.5">
+      <h2 class="text-sm font-semibold">{$t('fm.extract')}</h2>
+      <p class="mt-1 truncate font-mono text-xs text-muted">{archive.name}</p>
+    </header>
+    <p class="px-5 py-4 text-sm text-muted">{$t('fm.extractConfirm', { dir: dest })}</p>
+    <footer class="flex justify-end gap-2 border-t border-default px-5 py-3">
+      <button
+        type="button"
+        class="rounded-full px-4 py-2 text-sm text-muted transition hover:bg-surface-inset hover:text-fg"
+        onclick={() => (confirmExtract = null)}
+      >
+        {$t('common.cancel')}
+      </button>
+      <button
+        type="button"
+        class="rounded-full bg-accent px-5 py-2 text-sm font-medium text-accent-fg transition hover:opacity-90"
+        onclick={() => {
+          const op: RemoteFsOpDto = { kind: 'extract', archive: archive.path, dest };
+          confirmExtract = null;
+          void runRemote(op);
+        }}
+      >
+        {$t('fm.extract')}
+      </button>
+    </footer>
+  </Modal>
+{/if}
+
+{#if active && permsFor}
+  {@const targets = permsFor}
+  <PermissionsDialog
+    names={targets.map((e) => e.name)}
+    initial={targets[0]?.permissions ?? 0o644}
+    hasFolders={targets.some((e) => e.isDir)}
+    onCancel={() => (permsFor = null)}
+    onApply={(mode, recursive) => {
+      const paths = targets.map((e) => e.path);
+      permsFor = null;
+      void runRemote({ kind: 'chmod', paths, mode, recursive });
+    }}
+  />
 {/if}
 
 {#if active && view?.preview}

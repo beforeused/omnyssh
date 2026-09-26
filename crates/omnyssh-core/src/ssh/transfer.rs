@@ -64,6 +64,12 @@ const MAX_CHUNK: u64 = 256 * 1024;
 /// Per-request response timeout. Generous: with megabytes in flight on a slow
 /// link, a request legitimately queues behind the ones before it.
 const REQUEST_TIMEOUT_SECS: u64 = 120;
+/// How often one unit may resume after a dropped connection before its transfer
+/// is given up as failed.
+const MAX_RESUMES: u32 = 12;
+/// Pauses between a lane's reconnect attempts after its connection dropped
+/// (about a minute and a half in all).
+const RECONNECT_BACKOFF: &[u64] = &[1, 2, 4, 8, 15, 30, 30];
 /// A lane with nothing to do for this long closes its connection.
 const LANE_IDLE: Duration = Duration::from_secs(60);
 /// How often batched progress goes out.
@@ -107,6 +113,9 @@ pub struct TransferSpec {
 pub enum TransferState {
     Queued,
     Running,
+    /// The connection dropped mid-transfer; it resumes where the server stopped
+    /// acknowledging data once a connection is back.
+    Reconnecting,
     Done,
     Failed(String),
     Cancelled,
@@ -200,7 +209,7 @@ struct Channel {
     sftp: Arc<RawSftpSession>,
     read_len: u64,
     write_len: u64,
-    _ssh: SshSession,
+    ssh: SshSession,
 }
 
 impl Channel {
@@ -226,8 +235,28 @@ impl Channel {
             sftp: Arc::new(raw),
             read_len: read_len.clamp(1024, MAX_CHUNK),
             write_len: write_len.clamp(1024, MAX_CHUNK),
-            _ssh: ssh,
+            ssh,
         })
+    }
+
+    /// Resolves once the SSH connection under this channel is gone. A dropped
+    /// connection leaves pending SFTP requests waiting out their full timeout;
+    /// racing them against this notices the drop within a fraction of a second.
+    async fn gone(&self) {
+        while !self.ssh.is_closed() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Run one SFTP call, failing fast if the connection drops meanwhile.
+    async fn call<T>(
+        &self,
+        request: impl std::future::Future<Output = Result<T, SftpError>>,
+    ) -> Result<T, SftpError> {
+        tokio::select! {
+            result = request => result,
+            () = self.gone() => Err(closed()),
+        }
     }
 
     async fn stat(&self, path: &str) -> Result<Option<FileAttributes>, SftpError> {
@@ -286,6 +315,10 @@ impl Kind for FileAttributes {
     }
 }
 
+fn closed() -> SftpError {
+    SftpError::UnexpectedBehavior("connection closed".into())
+}
+
 fn is_status(e: &SftpError, code: StatusCode) -> bool {
     matches!(e, SftpError::Status(s) if s.status_code == code)
 }
@@ -313,7 +346,7 @@ struct Job {
     dirty: AtomicBool,
     /// Multi-segment jobs create/truncate their target once, before any segment
     /// opens it for writing.
-    prepared: OnceCell<Result<(), String>>,
+    prepared: OnceCell<()>,
     completion: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
 }
 
@@ -347,10 +380,28 @@ impl Job {
 
     fn mark_running(&self) {
         let mut state = self.state.lock().expect("job state lock");
-        if *state == TransferState::Queued {
+        if matches!(*state, TransferState::Queued | TransferState::Reconnecting) {
             *state = TransferState::Running;
             self.dirty.store(true, Ordering::Relaxed);
         }
+    }
+
+    fn mark_reconnecting(&self) {
+        let mut state = self.state.lock().expect("job state lock");
+        if matches!(*state, TransferState::Queued | TransferState::Running) {
+            *state = TransferState::Reconnecting;
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Take back progress for bytes that will be sent again after a resume.
+    fn unprogress(&self, n: u64) {
+        let _ = self
+            .done
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+                Some(d.saturating_sub(n))
+            });
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Move to a terminal state unless already in one. Returns whether it moved.
@@ -414,9 +465,55 @@ fn temp_name(name: &str) -> String {
 
 struct Unit {
     job: Arc<Job>,
+    /// Where this attempt starts — past the unit's original start once resumed.
     start: u64,
     end: u64,
     big: bool,
+    /// Resuming after a dropped connection: the target already exists and holds
+    /// everything before `start`, so it is opened without truncating.
+    resumed: bool,
+    attempts: u32,
+}
+
+/// Why a unit stopped short.
+enum UnitError {
+    /// Give up: permission denied, a missing file, a local I/O error, a cancel.
+    Fatal(String),
+    /// The connection went away. Everything before `resume_at` is safely at the
+    /// destination; the unit continues from there on a fresh connection.
+    Lost { reason: String, resume_at: u64 },
+}
+
+impl UnitError {
+    fn fatal(e: impl Into<String>) -> Self {
+        Self::Fatal(e.into())
+    }
+}
+
+/// Errors that mean "the connection is gone", as opposed to the server saying no.
+fn connection_lost(e: &SftpError) -> bool {
+    match e {
+        SftpError::Timeout | SftpError::IO(_) | SftpError::UnexpectedBehavior(_) => true,
+        SftpError::Status(s) => {
+            matches!(
+                s.status_code,
+                StatusCode::NoConnection | StatusCode::ConnectionLost
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Classify an SFTP failure that happened with everything before `resume_at` done.
+fn sftp_failure(what: String, e: SftpError, resume_at: u64) -> UnitError {
+    if connection_lost(&e) {
+        UnitError::Lost {
+            reason: format!("{what}: {e}"),
+            resume_at,
+        }
+    } else {
+        UnitError::Fatal(format!("{what}: {e}"))
+    }
 }
 
 fn split_units(job: &Arc<Job>) -> Vec<Unit> {
@@ -434,6 +531,8 @@ fn split_units(job: &Arc<Job>) -> Vec<Unit> {
                 ((i + 1) * step).min(size)
             },
             big,
+            resumed: false,
+            attempts: 0,
         })
         .collect()
 }
@@ -993,7 +1092,7 @@ impl Drop for TransferEngine {
 // ---------------------------------------------------------------------------
 
 async fn lane_loop(shared: Arc<Shared>) {
-    let channels = match connect_lane(&shared.host).await {
+    let mut channels = match connect_lane(&shared.host).await {
         Ok(channels) => channels,
         Err(e) => {
             tracing::warn!("transfer lane failed to connect: {e:#}");
@@ -1007,40 +1106,60 @@ async fn lane_loop(shared: Arc<Shared>) {
     let mut running = FuturesUnordered::new();
     let mut big_on = [false; CHANNELS_PER_LANE];
     let mut small_on = [0usize; CHANNELS_PER_LANE];
+    // The connection dropped: take no new work, let the running units wind down
+    // (they hand themselves back to the queue), then reconnect.
+    let mut broken = false;
     loop {
         let notified = shared.wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        loop {
-            let big_free = big_on.iter().position(|b| !b);
-            let small_total: usize = small_on.iter().sum();
-            let Some(unit) = take_unit(&shared, big_free.is_some(), small_total) else {
-                break;
-            };
-            let slot = if unit.big {
-                big_free.expect("take_unit only hands out a large unit to a free slot")
-            } else {
-                (0..CHANNELS_PER_LANE)
-                    .min_by_key(|&i| small_on[i])
-                    .expect("a lane has channels")
-            };
-            if unit.big {
-                big_on[slot] = true;
-            } else {
-                small_on[slot] += 1;
+        // Checked once: filling slots never breaks the connection.
+        if !broken {
+            loop {
+                let big_free = big_on.iter().position(|b| !b);
+                let small_total: usize = small_on.iter().sum();
+                let Some(unit) = take_unit(&shared, big_free.is_some(), small_total) else {
+                    break;
+                };
+                let slot = if unit.big {
+                    big_free.expect("take_unit only hands out a large unit to a free slot")
+                } else {
+                    (0..CHANNELS_PER_LANE)
+                        .min_by_key(|&i| small_on[i])
+                        .expect("a lane has channels")
+                };
+                if unit.big {
+                    big_on[slot] = true;
+                } else {
+                    small_on[slot] += 1;
+                }
+                let ch = channels[slot].clone();
+                running.push(async move {
+                    let big = unit.big;
+                    let requeue = run_unit(&ch, unit).await;
+                    (slot, big, requeue)
+                });
             }
-            let ch = channels[slot].clone();
-            running.push(async move {
-                let big = unit.big;
-                run_unit(&ch, unit).await;
-                (slot, big)
-            });
         }
 
         if running.is_empty() {
             if shared.closed.load(Ordering::Relaxed) {
                 break;
+            }
+            if broken {
+                match reconnect_lane(&shared).await {
+                    Ok(fresh) => {
+                        channels = fresh;
+                        broken = false;
+                        shared.wake.notify_waiters();
+                        continue;
+                    }
+                    Err(e) => {
+                        lane_gone(&shared, Some(e));
+                        return;
+                    }
+                }
             }
             tokio::select! {
                 _ = &mut notified => continue,
@@ -1056,14 +1175,43 @@ async fn lane_loop(shared: Arc<Shared>) {
             }
         } else {
             tokio::select! {
-                Some((slot, big)) = running.next() => {
+                Some((slot, big, requeue)) = running.next() => {
                     if big { big_on[slot] = false } else { small_on[slot] -= 1 }
+                    if let Some(unit) = requeue {
+                        // First in line again: for this lane once it is back, or any
+                        // other lane that is healthy now.
+                        shared.queue.lock().expect("queue lock").push_front(unit);
+                        broken = true;
+                        shared.wake.notify_waiters();
+                    }
                 }
                 _ = &mut notified => {}
             }
         }
     }
     lane_gone(&shared, None);
+}
+
+/// Reconnect a lane whose connection dropped, backing off between attempts.
+async fn reconnect_lane(shared: &Shared) -> Result<Vec<Arc<Channel>>, String> {
+    let mut last = String::new();
+    for secs in RECONNECT_BACKOFF {
+        tokio::time::sleep(Duration::from_secs(*secs)).await;
+        if shared.closed.load(Ordering::Relaxed) {
+            return Err("closed".into());
+        }
+        match connect_lane(&shared.host).await {
+            Ok(channels) => {
+                tracing::info!("transfer lane reconnected");
+                return Ok(channels);
+            }
+            Err(e) => {
+                tracing::warn!("transfer lane reconnect failed: {e:#}");
+                last = format!("{e:#}");
+            }
+        }
+    }
+    Err(format!("Connection lost and could not reconnect: {last}"))
 }
 
 /// Connects a lane: one SSH connection carrying [`CHANNELS_PER_LANE`] SFTP
@@ -1124,10 +1272,12 @@ fn take_unit(shared: &Shared, big_slot_free: bool, small_running: usize) -> Opti
     queue.remove(pos)
 }
 
-async fn run_unit(ch: &Channel, unit: Unit) {
+/// Run one unit. Returns it when the connection dropped and it should resume on a
+/// fresh one; otherwise the unit is finished (or its job failed).
+async fn run_unit(ch: &Channel, mut unit: Unit) -> Option<Unit> {
     let job = unit.job.clone();
     let result = if job.stopped() {
-        Err(CANCELLED.to_string())
+        Err(UnitError::fatal(CANCELLED))
     } else {
         job.mark_running();
         match job.spec.direction {
@@ -1135,13 +1285,30 @@ async fn run_unit(ch: &Channel, unit: Unit) {
             Direction::Download => download_range(ch, &unit).await,
         }
     };
-    drop(unit);
-    if let Err(e) = result {
-        job.fail(e);
+    match result {
+        Ok(()) => {}
+        Err(UnitError::Lost { reason, resume_at }) if !job.stopped() => {
+            if unit.attempts < MAX_RESUMES {
+                tracing::info!(
+                    "{}: {reason} — resuming at byte {resume_at}",
+                    job.spec.remote
+                );
+                unit.start = resume_at.clamp(unit.start, unit.end);
+                unit.resumed = true;
+                unit.attempts += 1;
+                job.mark_reconnecting();
+                return Some(unit);
+            }
+            job.fail(format!("Connection lost: {reason}"));
+        }
+        Err(UnitError::Lost { .. }) => job.fail(CANCELLED.to_string()),
+        Err(UnitError::Fatal(e)) => job.fail(e),
     }
+    drop(unit);
     if job.segments_left.fetch_sub(1, Ordering::AcqRel) == 1 {
         finalize(ch, &job).await;
     }
+    None
 }
 
 /// The last segment of a job finished: move the temp file into place, or clean
@@ -1208,30 +1375,44 @@ fn inflight_requests(chunk: u64) -> usize {
     (INFLIGHT_BYTES / chunk).clamp(4, 1024) as usize
 }
 
-async fn prepare_remote(ch: &Channel, job: &Job) -> Result<(), String> {
+async fn prepare_remote(ch: &Channel, job: &Job) -> Result<(), UnitError> {
     job.prepared
-        .get_or_init(|| async {
+        .get_or_try_init(|| async {
             let target = job.remote_target();
             let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
             let handle = ch
-                .sftp
-                .open(target.as_str(), flags, perm_attrs(job.spec.mode))
+                .call(
+                    ch.sftp
+                        .open(target.as_str(), flags, perm_attrs(job.spec.mode)),
+                )
                 .await
-                .map_err(|e| format!("create '{target}': {e}"))?
+                .map_err(|e| sftp_failure(format!("create '{target}'"), e, 0))?
                 .handle;
-            let _ = ch.sftp.close(handle).await;
+            let _ = ch.call(ch.sftp.close(handle)).await;
             Ok(())
         })
         .await
-        .clone()
+        .map(|_| ())
 }
 
-async fn upload_range(ch: &Channel, unit: &Unit) -> Result<(), String> {
+async fn upload_range(ch: &Channel, unit: &Unit) -> Result<(), UnitError> {
     let job = &unit.job;
     let target = job.remote_target();
     let (flags, attrs) = if job.segments > 1 {
-        prepare_remote(ch, job).await?;
+        prepare_remote(ch, job).await.map_err(|e| match e {
+            UnitError::Lost { reason, .. } => UnitError::Lost {
+                reason,
+                resume_at: unit.start,
+            },
+            fatal => fatal,
+        })?;
         (OpenFlags::WRITE, FileAttributes::empty())
+    } else if unit.resumed {
+        // The target already holds everything before `start`: keep it.
+        (
+            OpenFlags::WRITE | OpenFlags::CREATE,
+            FileAttributes::empty(),
+        )
     } else {
         (
             OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
@@ -1239,113 +1420,148 @@ async fn upload_range(ch: &Channel, unit: &Unit) -> Result<(), String> {
         )
     };
     let handle = ch
-        .sftp
-        .open(target.as_str(), flags, attrs)
+        .call(ch.sftp.open(target.as_str(), flags, attrs))
         .await
-        .map_err(|e| format!("open '{target}' for writing: {e}"))?
+        .map_err(|e| sftp_failure(format!("open '{target}' for writing"), e, unit.start))?
         .handle;
     let result = pump_upload(ch, &handle, unit).await;
-    let closed = ch.sftp.close(handle).await;
+    let closed = ch.call(ch.sftp.close(handle)).await;
     result?;
+    // Every write was acknowledged, so a failed close loses nothing already sent.
     closed
         .map(|_| ())
-        .map_err(|e| format!("finish '{target}': {e}"))
+        .map_err(|e| sftp_failure(format!("finish '{target}'"), e, unit.end))
 }
 
-async fn pump_upload(ch: &Channel, handle: &str, unit: &Unit) -> Result<(), String> {
+async fn pump_upload(ch: &Channel, handle: &str, unit: &Unit) -> Result<(), UnitError> {
     let job = &unit.job;
     let local = &job.spec.local;
     let mut file = tokio::fs::File::open(local)
         .await
-        .map_err(|e| format!("open '{}': {e}", local.display()))?;
+        .map_err(|e| UnitError::fatal(format!("open '{}': {e}", local.display())))?;
     if unit.start > 0 {
         file.seek(SeekFrom::Start(unit.start))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| UnitError::fatal(e.to_string()))?;
     }
     let mut reader = BufReader::with_capacity(LOCAL_BUF, file);
     let chunk = ch.write_len;
     let max_inflight = inflight_requests(chunk);
     let mut offset = unit.start;
     let mut inflight = FuturesUnordered::new();
+    // Offsets sent but not yet acknowledged, and bytes acknowledged this attempt:
+    // after a drop, everything below the lowest unacknowledged offset is on the
+    // server, and anything acknowledged above it is sent (and counted) again.
+    let mut unacked = std::collections::BTreeSet::new();
+    let mut acked: u64 = 0;
     loop {
         while offset < unit.end && inflight.len() < max_inflight {
             if job.stopped() {
-                return Err(CANCELLED.into());
+                return Err(UnitError::fatal(CANCELLED));
             }
             let n = chunk.min(unit.end - offset);
             let mut buf = vec![0u8; n as usize];
-            reader
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| format!("read '{}': {e} (did it change?)", local.display()))?;
+            reader.read_exact(&mut buf).await.map_err(|e| {
+                UnitError::fatal(format!("read '{}': {e} (did it change?)", local.display()))
+            })?;
             let sftp = ch.sftp.clone();
             let handle = handle.to_string();
             let at = offset;
-            inflight.push(async move { sftp.write(handle, at, buf).await.map(|_| n) });
+            unacked.insert(at);
+            inflight.push(async move { (at, n, sftp.write(handle, at, buf).await) });
             offset += n;
         }
-        match inflight.next().await {
+        let next = tokio::select! {
+            next = inflight.next() => next,
+            () = ch.gone() => Some((u64::MAX, 0, Err(closed()))),
+        };
+        match next {
             None => return Ok(()),
-            Some(Ok(n)) => job.progress(n),
-            Some(Err(e)) => return Err(format!("write: {e}")),
+            Some((at, n, Ok(_))) => {
+                unacked.remove(&at);
+                acked += n;
+                job.progress(n);
+            }
+            Some((_, _, Err(e))) => {
+                let resume_at = unacked.first().copied().unwrap_or(offset);
+                let failure = sftp_failure("write".into(), e, resume_at);
+                if matches!(failure, UnitError::Lost { .. }) {
+                    job.unprogress(acked.saturating_sub(resume_at - unit.start));
+                }
+                return Err(failure);
+            }
         }
         if job.stopped() {
-            return Err(CANCELLED.into());
+            return Err(UnitError::fatal(CANCELLED));
         }
     }
 }
 
-async fn prepare_local(job: &Job) -> Result<(), String> {
+async fn prepare_local(job: &Job) -> Result<(), UnitError> {
     job.prepared
-        .get_or_init(|| async {
+        .get_or_try_init(|| async {
             let target = job.local_target();
             let file = tokio::fs::File::create(&target)
                 .await
-                .map_err(|e| format!("create '{}': {e}", target.display()))?;
+                .map_err(|e| UnitError::fatal(format!("create '{}': {e}", target.display())))?;
             file.set_len(job.spec.size)
                 .await
-                .map_err(|e| format!("allocate '{}': {e}", target.display()))
+                .map_err(|e| UnitError::fatal(format!("allocate '{}': {e}", target.display())))
         })
         .await
-        .clone()
+        .map(|_| ())
 }
 
-async fn download_range(ch: &Channel, unit: &Unit) -> Result<(), String> {
+async fn download_range(ch: &Channel, unit: &Unit) -> Result<(), UnitError> {
     let job = &unit.job;
     let remote = job.spec.remote.as_str();
     let target = job.local_target();
+    let open_err =
+        |e: std::io::Error| UnitError::fatal(format!("open '{}': {e}", target.display()));
     let mut file = if job.segments > 1 {
         prepare_local(job).await?;
         tokio::fs::OpenOptions::new()
             .write(true)
             .open(&target)
             .await
-            .map_err(|e| format!("open '{}': {e}", target.display()))?
+            .map_err(open_err)?
+    } else if unit.resumed {
+        // Keep what arrived before the drop.
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&target)
+            .await
+            .map_err(open_err)?
     } else {
         tokio::fs::File::create(&target)
             .await
-            .map_err(|e| format!("create '{}': {e}", target.display()))?
+            .map_err(|e| UnitError::fatal(format!("create '{}': {e}", target.display())))?
     };
     if unit.start > 0 {
         file.seek(SeekFrom::Start(unit.start))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| UnitError::fatal(e.to_string()))?;
     }
     let handle = ch
-        .sftp
-        .open(remote, OpenFlags::READ, FileAttributes::empty())
+        .call(
+            ch.sftp
+                .open(remote, OpenFlags::READ, FileAttributes::empty()),
+        )
         .await
-        .map_err(|e| format!("open '{remote}': {e}"))?
+        .map_err(|e| sftp_failure(format!("open '{remote}'"), e, unit.start))?
         .handle;
     let mut writer = BufWriter::with_capacity(LOCAL_BUF, file);
     let result = pump_download(ch, &handle, unit, &mut writer).await;
-    let _ = ch.sftp.close(handle).await;
-    result?;
-    writer
+    let _ = ch.call(ch.sftp.close(handle)).await;
+    // Flush even after a drop: the resume point counts on those bytes being on disk.
+    let flushed = writer
         .flush()
         .await
-        .map_err(|e| format!("write '{}': {e}", target.display()))
+        .map_err(|e| UnitError::fatal(format!("write '{}': {e}", target.display())));
+    result?;
+    flushed
 }
 
 async fn pump_download(
@@ -1353,7 +1569,7 @@ async fn pump_download(
     handle: &str,
     unit: &Unit,
     writer: &mut BufWriter<tokio::fs::File>,
-) -> Result<(), String> {
+) -> Result<(), UnitError> {
     let job = &unit.job;
     let chunk = ch.read_len;
     let max_inflight = inflight_requests(chunk);
@@ -1362,7 +1578,13 @@ async fn pump_download(
         let handle = handle.to_string();
         async move { (at, len, sftp.read(handle, at, len as u32).await) }
     };
+    // The same race `Channel::call` runs, for the pipelined reads.
+    let read_now =
+        |at: u64, len: u64| async move { ch.call(async { read(at, len).await.2 }).await };
     let mut next = unit.start;
+    // Responses are written strictly in order, so everything before `written` is
+    // in the local file — the resume point after a drop.
+    let mut written = unit.start;
     let mut pending = FuturesOrdered::new();
     loop {
         while next < unit.end && pending.len() < max_inflight {
@@ -1370,13 +1592,16 @@ async fn pump_download(
             pending.push_back(read(next, len));
             next += len;
         }
-        let Some((at, len, result)) = pending.next().await else {
+        let next = tokio::select! {
+            next = pending.next() => next,
+            () = ch.gone() => return Err(sftp_failure("read".into(), closed(), written)),
+        };
+        let Some((at, len, result)) = next else {
             return Ok(());
         };
         if job.stopped() {
-            return Err(CANCELLED.into());
+            return Err(UnitError::fatal(CANCELLED));
         }
-        let mut pos = at;
         let mut result = result;
         // A short read (servers may cap the request size) leaves a gap before the
         // next queued response: fill it before writing on.
@@ -1387,18 +1612,18 @@ async fn pump_download(
                     writer
                         .write_all(&data.data)
                         .await
-                        .map_err(|e| format!("write local file: {e}"))?;
+                        .map_err(|e| UnitError::fatal(format!("write local file: {e}")))?;
                     job.progress(n);
-                    pos += n;
+                    written += n;
                 }
                 Ok(_) => return Ok(()),
                 Err(e) if is_status(&e, StatusCode::Eof) => return Ok(()),
-                Err(e) => return Err(format!("read: {e}")),
+                Err(e) => return Err(sftp_failure("read".into(), e, written)),
             }
-            if pos >= at + len {
+            if written >= at + len {
                 break;
             }
-            result = read(pos, at + len - pos).await.2;
+            result = read_now(written, at + len - written).await;
         }
     }
 }

@@ -92,6 +92,9 @@ pub struct Host {
     /// Whether password authentication has been disabled on the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_auth_disabled: Option<bool>,
+    /// Tunnelblick configuration to bring up before connecting (macOS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn: Option<String>,
 }
 
 fn default_user() -> String {
@@ -122,6 +125,7 @@ impl Default for Host {
             monitor_port: None,
             key_setup_date: None,
             password_auth_disabled: None,
+            vpn: None,
         }
     }
 }

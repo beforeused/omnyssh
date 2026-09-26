@@ -19,7 +19,7 @@ use crate::ssh::session::SshSession;
 // ---------------------------------------------------------------------------
 
 /// Metadata for a single file or directory in a file panel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FileEntry {
     /// Base file name (not the full path).
     pub name: String,
@@ -27,8 +27,14 @@ pub struct FileEntry {
     pub path: String,
     /// File size in bytes (`0` for directories).
     pub size: u64,
-    /// `true` when this entry is a directory.
+    /// `true` when this entry is a directory (a link to one counts).
     pub is_dir: bool,
+    /// Last modification, seconds since the Unix epoch, when known.
+    pub modified: Option<u64>,
+    /// Permission bits (`0o7777` mask), when known.
+    pub permissions: Option<u32>,
+    /// A symbolic link (followed for `is_dir`/`size`).
+    pub is_link: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +260,9 @@ async fn do_list_dir(
             path: parent_str.to_string(),
             size: 0,
             is_dir: true,
+            modified: None,
+            permissions: None,
+            is_link: false,
         });
     }
 
@@ -268,11 +277,23 @@ async fn do_list_dir(
             format!("{path}/{name}")
         };
 
+        // Links are followed so a link to a folder opens like one; a dangling
+        // link stays a plain entry.
+        let is_link = ft.is_symlink();
+        let target = if is_link {
+            sftp.metadata(full_path.as_str()).await.ok()
+        } else {
+            None
+        };
+        let shown = target.as_ref().unwrap_or(&meta);
         entries.push(FileEntry {
             name,
             path: full_path,
-            size: meta.size.unwrap_or(0),
-            is_dir: ft.is_dir(),
+            size: shown.size.unwrap_or(0),
+            is_dir: target.as_ref().map_or(ft.is_dir(), |t| t.is_dir()),
+            modified: meta.mtime.map(u64::from),
+            permissions: meta.permissions.map(|p| p & 0o7777),
+            is_link,
         });
     }
 
@@ -441,6 +462,9 @@ pub async fn list_local_dir(path: &str) -> anyhow::Result<Vec<FileEntry>> {
             path: parent_str.to_string(),
             size: 0,
             is_dir: true,
+            modified: None,
+            permissions: None,
+            is_link: false,
         });
     }
 
@@ -450,9 +474,27 @@ pub async fn list_local_dir(path: &str) -> anyhow::Result<Vec<FileEntry>> {
         .context("read local dir entry")?
     {
         let file_type = entry.file_type().await.ok();
-        let is_dir = file_type.as_ref().map(|ft| ft.is_dir()).unwrap_or(false);
-        let meta = entry.metadata().await.ok();
+        let is_link = file_type.as_ref().is_some_and(|ft| ft.is_symlink());
+        // Follow links (a link to a folder opens like one); fall back to the link
+        // itself when it dangles.
+        let meta = match tokio::fs::metadata(entry.path()).await {
+            Ok(m) => Some(m),
+            Err(_) => entry.metadata().await.ok(),
+        };
+        let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        #[cfg(unix)]
+        let permissions = meta.as_ref().map(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            m.permissions().mode() & 0o7777
+        });
+        #[cfg(not(unix))]
+        let permissions = None;
 
         let name = entry.file_name().to_string_lossy().into_owned();
         let path_str = entry.path().to_string_lossy().into_owned();
@@ -462,6 +504,9 @@ pub async fn list_local_dir(path: &str) -> anyhow::Result<Vec<FileEntry>> {
             path: path_str,
             size,
             is_dir,
+            modified,
+            permissions,
+            is_link,
         });
     }
 

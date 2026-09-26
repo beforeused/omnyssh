@@ -5,7 +5,7 @@ import type { Status } from '$lib/theme';
 // Stage 3 makes the sessions real (live PTY / SFTP). Ids come from one monotonic
 // space so a closed tab's id is never reused and terminal/SFTP ids never collide in
 // the frontend.
-export type SessionKind = 'terminal' | 'sftp';
+export type SessionKind = 'terminal' | 'sftp' | 'docker';
 export type SessionStatus = 'connecting' | 'connected' | 'failed' | 'unknown';
 
 /** Session state on the shared server-state palette — one source for every session dot
@@ -25,18 +25,28 @@ export interface Session {
   /** The backend public session id, set once `terminal_open` resolves (tech-gui.md
    *  §3.4). Undefined while connecting; the id crossing IPC is always this public id. */
   termId?: number;
+  /** A terminal types this once its shell is up (e.g. `docker exec` into a container). */
+  initialInput?: string;
+  /** Shown instead of the host name (e.g. "web-1 · nginx"). */
+  label?: string;
+}
+
+/** Extra settings for a new tab. */
+export interface SpawnOptions {
+  initialInput?: string;
+  label?: string;
 }
 
 /** The visible session label: just the host name. The type (terminal/SFTP) is already
  *  carried by the row's type icon, so the text stays compact and readable at any width. */
 export function sessionLabel(s: Session): string {
-  return s.hostName;
+  return s.label ?? s.hostName;
 }
 
 /** The accessible/tooltip label: host + type, so hover and screen readers still convey
  *  the connection type the icon shows visually. */
 export function sessionTitle(s: Session): string {
-  return `${s.hostName} · ${s.kind}`;
+  return `${s.label ?? s.hostName} · ${s.kind}`;
 }
 
 function createSessions() {
@@ -44,8 +54,8 @@ function createSessions() {
   let nextId = 1;
   return {
     subscribe,
-    spawn(kind: SessionKind, hostName: string): Session {
-      const session: Session = { id: nextId++, kind, hostName, status: 'connecting' };
+    spawn(kind: SessionKind, hostName: string, options: SpawnOptions = {}): Session {
+      const session: Session = { id: nextId++, kind, hostName, status: 'connecting', ...options };
       update((list) => [...list, session]);
       return session;
     },

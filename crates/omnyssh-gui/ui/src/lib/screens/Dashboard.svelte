@@ -206,6 +206,15 @@
                   {/if}
                   <!-- Auth-state reflection (tech-gui.md §4.2): key-only once password
                        auth is disabled, otherwise a plain key badge when a key exists. -->
+                  {#if card.host.vpn}
+                    <span
+                      class="inline-flex max-w-[9rem] shrink-0 items-center gap-1 truncate rounded-full border border-default px-1.5 py-0.5 text-[10px] text-faint"
+                      title={$t('vpn.badge', { name: card.host.vpn })}
+                    >
+                      <Icon name="lock" size={10} />
+                      VPN
+                    </span>
+                  {/if}
                   {#if card.host.passwordAuthDisabled}
                     <span
                       class="inline-flex shrink-0 items-center gap-1 rounded-full border border-default px-1.5 py-0.5 text-[10px] text-faint"
@@ -242,6 +251,17 @@
                   {action.label}
                 </button>
               {/each}
+              {#if card.detectedServices.some((svc) => svc.kind === 'docker')}
+                <button
+                  type="button"
+                  class={pill}
+                  title={$t('dash.action', { action: 'docker', host: card.host.name })}
+                  onclick={() => spawnSession('docker', card.host.name)}
+                >
+                  <Icon name="docker" size={13} />
+                  {$t('docker.open')}
+                </button>
+              {/if}
               <!-- SSH key (tech-gui.md §4.2): install a new or an existing key, and pick
                    password + key or key-only logins. Offered for every host — an
                    ~/.ssh/config import is adopted into hosts.toml when its key is saved. -->

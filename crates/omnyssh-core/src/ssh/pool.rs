@@ -232,7 +232,8 @@ async fn run_ssh_poller(
         // Ensure we have a live session.
         if session.is_none() {
             send_status(&tx, &host.name, ConnectionStatus::Connecting).await;
-            match SshSession::connect(&host).await {
+            // Polling never starts a host's VPN; it waits for the user to.
+            match SshSession::connect_passive(&host).await {
                 Ok(s) => {
                     send_status(&tx, &host.name, ConnectionStatus::Connected).await;
                     session = Some(s);

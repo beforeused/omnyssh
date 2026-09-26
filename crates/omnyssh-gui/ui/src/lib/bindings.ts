@@ -397,6 +397,141 @@ async editConfirmUpload(sessionId: number, remotePath: string, upload: boolean) 
 }
 },
 /**
+ * Run a file operation on the server of SFTP tab `session_id`.
+ */
+async remoteFsOp(sessionId: number, op: RemoteFsOpDto) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remote_fs_op", { sessionId, op }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Run a file operation on this machine.
+ */
+async localFsOp(op: LocalFsOpDto) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("local_fs_op", { op }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Every container on `host_name`, running ones with live CPU and memory.
+ */
+async dockerList(hostName: string) : Promise<Result<DockerListDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("docker_list", { hostName }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start / stop / restart / pause / unpause / remove a container.
+ */
+async dockerAction(hostName: string, id: string, action: DockerActionDto) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("docker_action", { hostName, id, action }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The last `tail` lines of a container's log.
+ */
+async dockerLogs(hostName: string, id: string, tail: number) : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("docker_logs", { hostName, id, tail }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * What a terminal types to open a shell inside the container.
+ */
+async dockerShellCommand(id: string, sudo: boolean) : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("docker_shell_command", { id, sudo }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async vpnStatus() : Promise<Result<VpnStatusDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("vpn_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Tunnelblick's configuration names.
+ */
+async vpnConfigurations() : Promise<Result<string[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("vpn_configurations") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Hand an .ovpn/.conf/.tblk file to Tunnelblick to install.
+ */
+async vpnImport(path: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("vpn_import", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Tunnelblick's state for a configuration (`CONNECTED`, `EXITING`, …).
+ */
+async vpnState(name: string) : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("vpn_state", { name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async vpnConnect(name: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("vpn_connect", { name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async vpnDisconnect(name: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("vpn_disconnect", { name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Download, verify and install Tunnelblick; progress arrives as
+ * `vpn-install-progress`. Resolves when it is installed (and launched).
+ */
+async vpnInstall() : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("vpn_install") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Install a key on `host_name` (tech-gui.md §4.2): a new one or `key`, with
  * logins afterwards per `mode`. Fire-and-forget; reports via `key-setup-*` events.
  * One run at a time, so two runs never race a `hosts.toml` write.
@@ -552,7 +687,8 @@ sftpOpDone: SftpOpDone,
 snippetResult: SnippetResult,
 terminalExited: TerminalExited,
 transfersUpdated: TransfersUpdated,
-updateAvailable: UpdateAvailable
+updateAvailable: UpdateAvailable,
+vpnInstallProgress: VpnInstallProgress
 }>({
 editSync: "edit-sync",
 error: "error",
@@ -573,7 +709,8 @@ sftpOpDone: "sftp-op-done",
 snippetResult: "snippet-result",
 terminalExited: "terminal-exited",
 transfersUpdated: "transfers-updated",
-updateAvailable: "update-available"
+updateAvailable: "update-available",
+vpnInstallProgress: "vpn-install-progress"
 })
 
 /** user-defined constants **/
@@ -582,6 +719,7 @@ updateAvailable: "update-available"
 
 /** user-defined types **/
 
+export type ArchiveFormatDto = "tarGz" | "zip"
 /**
  * How the server accepts logins after key setup.
  */
@@ -597,6 +735,13 @@ export type ConflictResolutionDto = { index: number; action: ConflictActionDto }
  * frontend consumes a discriminated union keyed on `kind`.
  */
 export type ConnectionStatusDto = { kind: "unknown" } | { kind: "connecting" } | { kind: "connected" } | { kind: "failed"; message: string }
+export type ContainerDto = { id: string; name: string; image: string; state: string; status: string; ports: string; created: string; cpu?: string | null; memory?: string | null }
+export type DockerActionDto = "start" | "stop" | "restart" | "pause" | "unpause" | "remove"
+export type DockerListDto = { containers: ContainerDto[]; 
+/**
+ * The login user needed `sudo` for docker (exec shells need it too).
+ */
+sudo: boolean }
 /**
  * A remote file open in an external editor was saved locally and is being (or
  * was) pushed back, or needs the user because the server copy changed too.
@@ -648,7 +793,15 @@ export type Error = { message: string }
  * A file or directory in an SFTP panel listing (tech-gui.md §4.1). Maps from the
  * core `FileEntry`; `path` is the absolute path the frontend marks entries by.
  */
-export type FileEntryDto = { name: string; path: string; size: number; isDir: boolean }
+export type FileEntryDto = { name: string; path: string; size: number; isDir: boolean; 
+/**
+ * Last modification, seconds since the Unix epoch.
+ */
+modified?: number | null; 
+/**
+ * Permission bits (`0o7777` mask).
+ */
+permissions?: number | null; isLink: boolean }
 /**
  * Preview bytes for a remote file (tech-gui.md §4.3). Stamped with `sessionId`; the
  * core `FilePreviewReady` carries only the path + content (§3.4).
@@ -666,7 +819,11 @@ export type HostAuthDto = { identityFile?: string | null; hasPassword: boolean }
  * (tech-gui.md §3.4). `hasKey` reports whether an identity file is configured;
  * the key path itself never crosses the boundary.
  */
-export type HostDto = { name: string; hostname: string; user: string; port: number; tags: string[]; notes?: string | null; source: HostSourceDto; hasKey: boolean; passwordAuthDisabled?: boolean | null; monitoring: MonitorModeDto; monitorPort?: number | null }
+export type HostDto = { name: string; hostname: string; user: string; port: number; tags: string[]; notes?: string | null; source: HostSourceDto; hasKey: boolean; passwordAuthDisabled?: boolean | null; monitoring: MonitorModeDto; monitorPort?: number | null; 
+/**
+ * Tunnelblick configuration brought up before connecting.
+ */
+vpn?: string | null }
 /**
  * Inbound host form payload for `save_host` (tech-gui.md §4.1, Stage 4.1). Always
  * builds a **manual** `Host`: editing an SSH-config import saves a copy that shadows
@@ -680,7 +837,11 @@ export type HostInputDto = { name: string; hostname: string; user: string; port:
  * Drop the stored identity file (the form's "default key / agent" choice).
  * Without it, an absent `identityFile` keeps the stored one.
  */
-clearIdentity?: boolean | null; tags: string[]; notes?: string | null; monitoring?: MonitorModeDto | null; monitorPort?: number | null }
+clearIdentity?: boolean | null; tags: string[]; notes?: string | null; monitoring?: MonitorModeDto | null; monitorPort?: number | null; 
+/**
+ * Tunnelblick configuration to bring up first; absent means none.
+ */
+vpn?: string | null }
 /**
  * Host origin, mirrors `omnyssh_core::ssh::client::HostSource`.
  */
@@ -744,6 +905,14 @@ export type KeySetupRollback = { hostName: string; result: string }
  */
 export type KeySetupStepDto = { id: string; index: number; total: number; description: string }
 /**
+ * A file operation on this machine.
+ */
+export type LocalFsOpDto = { kind: "mkdir"; path: string } | { kind: "rename"; from: string; to: string } | 
+/**
+ * Move to the Trash (recoverable).
+ */
+{ kind: "trash"; paths: string[] } | { kind: "newFile"; path: string }
+/**
  * A metrics snapshot for a host (tech-gui.md §4.1). The core's `Instant` is
  * flattened to `ageSeconds` (seconds since the sample) so it can serialise.
  */
@@ -765,6 +934,18 @@ export type PreparedBatchDto = { batchId: number; files: number; bytes: number; 
  * A single process in the "top processes" panel (tech-gui.md §4.1).
  */
 export type ProcessDto = { name: string; cpuPercent: number; memPercent: number }
+/**
+ * A file operation on the server that SFTP has no verb for.
+ */
+export type RemoteFsOpDto = 
+/**
+ * Delete files and folders (recursively).
+ */
+{ kind: "delete"; paths: string[] } | 
+/**
+ * Pack entries of `dir` into `dir/archive`.
+ */
+{ kind: "compress"; dir: string; names: string[]; archive: string; format: ArchiveFormatDto } | { kind: "extract"; archive: string; dest: string } | { kind: "chmod"; paths: string[]; mode: number; recursive: boolean } | { kind: "newFile"; path: string } | { kind: "copy"; paths: string[]; dest: string } | { kind: "move"; paths: string[]; dest: string }
 /**
  * A service detected on a host with its quick-scan metrics (tech-gui.md §4.1).
  */
@@ -870,7 +1051,11 @@ export type TransferDirectionDto = "upload" | "download"
  * list it before its first progress update lands.
  */
 export type TransferItemDto = { id: number; direction: TransferDirectionDto; name: string; local: string; remote: string; size: number }
-export type TransferStateDto = "queued" | "running" | "done" | "failed" | "cancelled"
+export type TransferStateDto = "queued" | "running" | 
+/**
+ * The connection dropped; resuming once it is back.
+ */
+"reconnecting" | "done" | "failed" | "cancelled"
 /**
  * Batched progress/state for one transfer (the engine reports ~7×/s).
  */
@@ -897,6 +1082,20 @@ export type UpdateConfigDto = { checkOnStartup: boolean; skipVersion: string }
  * none is invented (§4.1).
  */
 export type UpdateInfoDto = { version: string; url: string; tag: string; canSelfUpdate: boolean }
+/**
+ * Progress of installing Tunnelblick (`vpn_install`).
+ */
+export type VpnInstallProgress = { stage: VpnInstallStageDto; done: number; total: number; error?: string | null }
+export type VpnInstallStageDto = "downloading" | "verifying" | "installing" | "done" | "failed"
+export type VpnStatusDto = { 
+/**
+ * Tunnelblick can be used on this OS (macOS).
+ */
+supported: boolean; installed: boolean; 
+/**
+ * The Tunnelblick release the app installs.
+ */
+installsVersion: string }
 
 /** tauri-specta globals **/
 

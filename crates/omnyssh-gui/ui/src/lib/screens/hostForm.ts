@@ -19,6 +19,8 @@ export interface HostFormFields {
   monitoring: MonitorModeDto;
   /** Probe port; blank means "the host's SSH port". Only read for `tcpPort`. */
   monitorPort: string;
+  /** Tunnelblick configuration to bring up first; blank means none. */
+  vpn: string;
 }
 
 export function emptyForm(): HostFormFields {
@@ -34,7 +36,8 @@ export function emptyForm(): HostFormFields {
     tags: '',
     notes: '',
     monitoring: 'ssh',
-    monitorPort: ''
+    monitorPort: '',
+    vpn: ''
   };
 }
 
@@ -52,7 +55,8 @@ export function formFromHost(h: HostDto): HostFormFields {
     tags: h.tags.join(', '),
     notes: h.notes ?? '',
     monitoring: h.monitoring,
-    monitorPort: h.monitorPort == null ? '' : String(h.monitorPort)
+    monitorPort: h.monitorPort == null ? '' : String(h.monitorPort),
+    vpn: h.vpn ?? ''
   };
 }
 
@@ -115,7 +119,8 @@ export function formToInput(f: HostFormFields): HostFormResult {
       tags,
       notes: notes || undefined,
       monitoring: f.monitoring,
-      monitorPort
+      monitorPort,
+      vpn: f.vpn.trim() || undefined
     }
   };
 }

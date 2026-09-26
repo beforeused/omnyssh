@@ -30,4 +30,14 @@ export type IconName =
   | 'eye'
   | 'external'
   | 'chevron-up'
-  | 'chevron-down';
+  | 'chevron-down'
+  | 'docker'
+  | 'bookmark'
+  | 'eye-off'
+  | 'lock'
+  | 'arrow-up'
+  | 'archive'
+  | 'copy'
+  | 'stop'
+  | 'pause'
+  | 'list';

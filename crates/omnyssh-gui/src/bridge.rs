@@ -209,6 +209,7 @@ mod tests {
             path: format!("/srv/{name}"),
             size: 0,
             is_dir: false,
+            ..Default::default()
         }
     }
 
