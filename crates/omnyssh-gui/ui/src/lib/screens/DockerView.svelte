@@ -9,7 +9,7 @@
   import { t } from '$lib/i18n';
   import type { ContainerDto, DockerActionDto } from '$lib/bindings';
   import { sessions, type Session } from '$lib/stores/sessions';
-  import { spawnSession } from '$lib/stores/navigation';
+  import { connectSession } from '$lib/stores/navigation';
   import { lastError } from '$lib/stores/notifications';
   import { dockerList, dockerAction, dockerLogs, dockerShellCommand } from '$lib/ipc/commands';
 
@@ -88,7 +88,7 @@
   async function openShell(c: ContainerDto): Promise<void> {
     try {
       const command = await dockerShellCommand(c.name || c.id, sudo);
-      spawnSession('terminal', session.hostName, {
+      void connectSession('terminal', session.hostName, {
         initialInput: `${command}\n`,
         label: `${session.hostName} · ${c.name}`
       });

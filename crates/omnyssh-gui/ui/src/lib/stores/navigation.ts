@@ -1,6 +1,9 @@
 import { get } from 'svelte/store';
 import { activeEntity } from './activeEntity';
 import { sessions, type Session, type SessionKind, type SpawnOptions } from './sessions';
+import { keyPassphrasePrompt } from './keyPassphrase';
+import { lastError } from './notifications';
+import { getDefaultKey, hostAuth, keyPassphraseRequired } from '$lib/ipc/commands';
 
 // Composed navigation actions that keep the sessions list and the active entity in
 // step (tech-gui.md §2). A spawn appends a session and makes it active (both spawn
@@ -10,6 +13,27 @@ export function spawnSession(kind: SessionKind, hostName: string, options?: Spaw
   const session = sessions.spawn(kind, hostName, options);
   activeEntity.activateSession(session.id);
   return session;
+}
+
+/** Unlock the host's selected encrypted key before creating a session. The secret is
+ * validated backend-side and retained only in process memory. */
+export async function connectSession(
+  kind: SessionKind,
+  hostName: string,
+  options?: SpawnOptions
+): Promise<Session | undefined> {
+  try {
+    const auth = await hostAuth(hostName);
+    const keyPath = auth.identityFile ?? (await getDefaultKey());
+    if (keyPath && (await keyPassphraseRequired(keyPath))) {
+      const proceed = await keyPassphrasePrompt.request({ hostName, keyPath });
+      if (!proceed) return undefined;
+    }
+    return spawnSession(kind, hostName, options);
+  } catch (error) {
+    lastError.set(error instanceof Error ? error.message : String(error));
+    return undefined;
+  }
 }
 
 // A tab may veto its own close (an SFTP tab with transfers still running asks

@@ -22,7 +22,8 @@ use commands::editor::{
 use commands::files::{local_fs_op, remote_fs_op};
 use commands::hosts::{delete_host, list_hosts, refresh_metrics, reload_hosts, save_host};
 use commands::keysetup::{
-    get_default_key, host_auth, inspect_ssh_key, list_ssh_keys, set_default_key, start_key_setup,
+    get_default_key, host_auth, inspect_ssh_key, key_passphrase_required, list_ssh_keys,
+    set_default_key, start_key_setup, unlock_ssh_key,
 };
 use commands::sftp::{
     list_local_dir, preview_local_file, sftp_close, sftp_delete, sftp_list, sftp_mkdir, sftp_open,
@@ -150,6 +151,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             start_key_setup,
             list_ssh_keys,
             inspect_ssh_key,
+            key_passphrase_required,
+            unlock_ssh_key,
             get_default_key,
             set_default_key,
             host_auth,

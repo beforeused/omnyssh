@@ -16,6 +16,7 @@
   import TerminalView from '$lib/screens/TerminalView.svelte';
   import SftpView from '$lib/screens/SftpView.svelte';
   import DockerView from '$lib/screens/DockerView.svelte';
+  import KeyPassphraseDialog from '$lib/components/KeyPassphraseDialog.svelte';
 
   onMount(async () => {
     try {
@@ -64,3 +65,5 @@
     {/if}
   </div>
 </AppShell>
+
+<KeyPassphraseDialog />

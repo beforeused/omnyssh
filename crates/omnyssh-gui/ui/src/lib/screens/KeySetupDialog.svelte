@@ -9,7 +9,13 @@
   import { Button, Icon } from '$lib/theme';
   import { t, type MessageKey } from '$lib/i18n';
   import type { AuthModeDto, HostDto, SshKeyDto } from '$lib/bindings';
-  import { hostAuth, inspectSshKey, startKeySetup } from '$lib/ipc/commands';
+  import {
+    hostAuth,
+    inspectSshKey,
+    keyPassphraseRequired,
+    startKeySetup,
+    unlockSshKey
+  } from '$lib/ipc/commands';
   import {
     sshKeys,
     defaultKey,
@@ -29,6 +35,10 @@
   /** Keys picked by hand from outside ~/.ssh, listed alongside the found ones. */
   let extraKeys = $state<SshKeyDto[]>([]);
   let pickError = $state<string | null>(null);
+  let passphrase = $state('');
+  let needsPassphrase = $state(false);
+  let passphraseError = $state<string | null>(null);
+  let keyCheck = 0;
   // svelte-ignore state_referenced_locally
   let newName = $state(`omnyssh_${host.name.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64) || 'unnamed_host'}_ed25519`);
   // svelte-ignore state_referenced_locally
@@ -56,8 +66,26 @@
   });
 
   const canStart = $derived(
-    !starting && (tab === 'new' ? nameError === null : keyPath !== '')
+    !starting &&
+      (tab === 'new' ? nameError === null : keyPath !== '' && (!needsPassphrase || passphrase !== ''))
   );
+
+  async function chooseKey(path: string): Promise<void> {
+    keyPath = path;
+    passphrase = '';
+    passphraseError = null;
+    const encrypted = keys.find((key) => key.path === path)?.encrypted ?? false;
+    needsPassphrase = encrypted;
+    const check = ++keyCheck;
+    if (!encrypted) return;
+    try {
+      const required = await keyPassphraseRequired(path);
+      if (check === keyCheck) needsPassphrase = required;
+    } catch {
+      // The install command will report a disappeared/unreadable key. Keep the
+      // passphrase field visible meanwhile rather than silently treating it as plain.
+    }
+  }
 
   onMount(async () => {
     await Promise.all([refreshKeys(), loadDefaultKey()]);
@@ -69,10 +97,14 @@
     // Preselect: the host's own key, else the default key, else the first key found.
     const initial = currentKey ?? $defaultKey ?? $sshKeys[0]?.path ?? '';
     if (initial) {
-      keyPath = initial;
       if (!$sshKeys.some((k) => k.path === initial)) {
-        extraKeys = [{ path: initial, name: keyFileName(initial), encrypted: false }];
+        try {
+          extraKeys = [await inspectSshKey(initial)];
+        } catch {
+          extraKeys = [{ path: initial, name: keyFileName(initial), encrypted: false }];
+        }
       }
+      await chooseKey(initial);
     } else {
       tab = 'new';
     }
@@ -85,7 +117,7 @@
     try {
       const key = await inspectSshKey(path);
       if (!keys.some((k) => k.path === key.path)) extraKeys = [...extraKeys, key];
-      keyPath = key.path;
+      await chooseKey(key.path);
     } catch {
       pickError = $t('keys.notAKey', { path });
     }
@@ -94,6 +126,19 @@
   async function start(): Promise<void> {
     if (!canStart) return;
     starting = true;
+    passphraseError = null;
+    if (tab === 'existing' && needsPassphrase) {
+      try {
+        await unlockSshKey(keyPath, passphrase);
+        passphrase = '';
+        needsPassphrase = false;
+      } catch {
+        passphrase = '';
+        passphraseError = $t('keypass.invalid');
+        starting = false;
+        return;
+      }
+    }
     // Read everything before closing: the owner drops this dialog (and its props)
     // the moment `onClose` runs.
     const hostName = host.name;
@@ -193,7 +238,7 @@
                 aria-label={k.name}
                 class="{card} {cardState(on)}"
                 title={k.path}
-                onclick={() => (keyPath = k.path)}
+                onclick={() => void chooseKey(k.path)}
               >
                 <span
                   class="grid h-8 w-8 shrink-0 place-items-center rounded-full border
@@ -231,6 +276,22 @@
             {/if}
             {#if keys.find((k) => k.path === keyPath)?.encrypted}
               <p class="text-xs text-status-warn">{$t('keysetup.encryptedWarn')}</p>
+              {#if needsPassphrase}
+                <label class="block space-y-1.5 pt-1">
+                  <span class="text-xs font-medium text-muted">{$t('keypass.label')}</span>
+                  <input
+                    bind:value={passphrase}
+                    type="password"
+                    autocomplete="off"
+                    spellcheck="false"
+                    class="w-full rounded-lg bg-surface-inset px-3 py-2 text-sm text-fg outline-none focus-visible:ring-2 focus-visible:ring-focus"
+                  />
+                </label>
+                <p class="text-[11px] text-faint">{$t('keypass.memoryOnly')}</p>
+              {/if}
+              {#if passphraseError}
+                <p class="text-xs text-status-crit">{passphraseError}</p>
+              {/if}
             {/if}
           </div>
         {:else}

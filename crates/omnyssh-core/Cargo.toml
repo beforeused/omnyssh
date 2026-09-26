@@ -39,6 +39,7 @@ chrono = { workspace = true }
 
 # Cross-platform paths (P-CROSS-01)
 dirs = { workspace = true }
+zeroize = { workspace = true }
 
 # glob(7) patterns in ssh_config `Include` directives
 glob = "0.3"

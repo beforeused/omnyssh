@@ -567,6 +567,31 @@ async inspectSshKey(path: string) : Promise<Result<SshKeyDto, CommandError>> {
 }
 },
 /**
+ * Whether an encrypted key still needs its passphrase in this app process. The
+ * passphrase itself is never persisted; an unlocked key becomes locked again when
+ * OmnySSH exits.
+ */
+async keyPassphraseRequired(path: string) : Promise<Result<boolean, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("key_passphrase_required", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Validate an encrypted key's passphrase and retain it in zeroizing process memory.
+ * It is never written to `hosts.toml`, app settings, logs, or the frontend again.
+ */
+async unlockSshKey(path: string, passphrase: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("unlock_ssh_key", { path, passphrase }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The app-wide default key (used by hosts that name none), if set.
  */
 async getDefaultKey() : Promise<Result<string | null, CommandError>> {

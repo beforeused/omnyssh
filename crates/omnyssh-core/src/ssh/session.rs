@@ -12,8 +12,9 @@
 //! - Connect timeout: 10 seconds (per hop)
 //! - Command timeout: 30 seconds
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -21,8 +22,43 @@ use async_trait::async_trait;
 use russh::client::{self, Handle};
 use russh::ChannelMsg;
 use tokio::time;
+use zeroize::Zeroizing;
 
 use crate::ssh::client::Host;
+
+/// Passphrases unlocked by a frontend for this process only. Paths are expanded before
+/// they become keys, and values are zeroed when replaced. Nothing here is serialized:
+/// quitting OmnySSH locks every encrypted key again.
+static KEY_PASSPHRASES: LazyLock<RwLock<HashMap<PathBuf, Zeroizing<String>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Validate and cache the passphrase for `path` for the lifetime of this process.
+///
+/// # Errors
+/// The key cannot be read or `passphrase` does not decrypt it.
+pub fn unlock_key(path: &Path, passphrase: String) -> anyhow::Result<()> {
+    russh::keys::load_secret_key(path, Some(&passphrase))
+        .with_context(|| format!("unlock SSH key {}", path.display()))?;
+    KEY_PASSPHRASES
+        .write()
+        .map_err(|_| anyhow!("SSH key passphrase cache is unavailable"))?
+        .insert(path.to_path_buf(), Zeroizing::new(passphrase));
+    Ok(())
+}
+
+/// Whether `path` has already been unlocked in this process.
+pub fn key_is_unlocked(path: &Path) -> bool {
+    KEY_PASSPHRASES
+        .read()
+        .is_ok_and(|passphrases| passphrases.contains_key(path))
+}
+
+fn cached_key_passphrase(path: &Path) -> Option<Zeroizing<String>> {
+    KEY_PASSPHRASES
+        .read()
+        .ok()
+        .and_then(|passphrases| passphrases.get(path).cloned())
+}
 
 // ---------------------------------------------------------------------------
 // russh Handler implementation
@@ -724,8 +760,10 @@ async fn try_key_auth(
 ) -> anyhow::Result<bool> {
     // load_secret_key is synchronous (file I/O) — offload to blocking pool.
     let path = key_path.to_string();
+    let passphrase = cached_key_passphrase(Path::new(&path));
     let key_pair = tokio::task::spawn_blocking(move || {
-        russh::keys::load_secret_key(&path, None).with_context(|| format!("load key from {path}"))
+        russh::keys::load_secret_key(&path, passphrase.as_ref().map(|value| value.as_str()))
+            .with_context(|| format!("load key from {path}"))
     })
     .await
     .context("spawn_blocking panicked")??;
@@ -827,4 +865,33 @@ fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cached_key_passphrase, key_is_unlocked, unlock_key};
+
+    #[test]
+    fn encrypted_key_can_be_unlocked_for_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("protected_ed25519");
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "correct horse", "-f"])
+            .arg(&path)
+            .status();
+        if !status.is_ok_and(|s| s.success()) {
+            return; // ssh-keygen is optional in the test environment.
+        }
+
+        assert!(!key_is_unlocked(&path));
+        assert!(unlock_key(&path, "wrong".to_string()).is_err());
+        assert!(!key_is_unlocked(&path));
+
+        unlock_key(&path, "correct horse".to_string()).unwrap();
+        assert!(key_is_unlocked(&path));
+        assert_eq!(
+            cached_key_passphrase(&path).as_deref().map(String::as_str),
+            Some("correct horse")
+        );
+    }
 }

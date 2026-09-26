@@ -10,7 +10,7 @@
   import type { HostDto, HostInputDto } from '$lib/bindings';
   import { Surface, Chip, StatusDot, Icon, Button, statusToken } from '$lib/theme';
   import { serverCards, filterHosts, QUICK_ACTIONS } from './serverCard';
-  import { spawnSession } from '$lib/stores/navigation';
+  import { connectSession } from '$lib/stores/navigation';
   import { streamerMode, displayHostname } from '$lib/stores/streamer';
   import { hosts } from '$lib/stores/hosts';
   import { lastError } from '$lib/stores/notifications';
@@ -245,7 +245,7 @@
                   type="button"
                   class={pill}
                   title={$t('dash.action', { action: action.label, host: card.host.name })}
-                  onclick={() => spawnSession(action.kind, card.host.name)}
+                  onclick={() => void connectSession(action.kind, card.host.name)}
                 >
                   <Icon name={action.kind} size={13} />
                   {action.label}
@@ -256,7 +256,7 @@
                   type="button"
                   class={pill}
                   title={$t('dash.action', { action: 'docker', host: card.host.name })}
-                  onclick={() => spawnSession('docker', card.host.name)}
+                  onclick={() => void connectSession('docker', card.host.name)}
                 >
                   <Icon name="docker" size={13} />
                   {$t('docker.open')}

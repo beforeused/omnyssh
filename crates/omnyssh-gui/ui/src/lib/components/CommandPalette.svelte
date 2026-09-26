@@ -11,7 +11,7 @@
   import { statuses } from '$lib/stores/statuses';
   import { sessions, sessionLabel, sessionStatusDot } from '$lib/stores/sessions';
   import { activeEntity } from '$lib/stores/activeEntity';
-  import { spawnSession } from '$lib/stores/navigation';
+  import { connectSession } from '$lib/stores/navigation';
   import { streamerMode, displayHostname } from '$lib/stores/streamer';
   import { isPaletteChord } from '$lib/stores/ui';
 
@@ -86,8 +86,8 @@
       palette.choose(item.host);
     } else {
       // Navigator default action for a host: open a shell (the primary connect path).
-      spawnSession('terminal', item.host.name);
       palette.close();
+      void connectSession('terminal', item.host.name);
     }
   }
 

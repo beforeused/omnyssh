@@ -181,6 +181,19 @@ export async function startKeySetup(
   if (res.status === 'error') throw new Error(res.error.message);
 }
 
+/** Whether this encrypted key still needs to be unlocked in the current app process. */
+export async function keyPassphraseRequired(path: string): Promise<boolean> {
+  const res = await commands.keyPassphraseRequired(path);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+/** Validate a key passphrase and retain it in backend process memory only. */
+export async function unlockSshKey(path: string, passphrase: string): Promise<void> {
+  const res = await commands.unlockSshKey(path, passphrase);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
 /** Force an immediate metric poll of every host (tech-gui.md §4.2). */
 export async function refreshMetrics(): Promise<void> {
   const res = await commands.refreshMetrics();

@@ -17,7 +17,7 @@
     type SessionKind
   } from '$lib/stores/sessions';
   import { sidebarCollapsed } from '$lib/stores/ui';
-  import { spawnSession, closeSession } from '$lib/stores/navigation';
+  import { connectSession, closeSession } from '$lib/stores/navigation';
   import { palette } from '$lib/stores/palette';
   import { support } from '$lib/stores/support';
 
@@ -25,7 +25,7 @@
   // a session of its kind for the chosen host. A dismissed picker spawns nothing.
   async function pickAndSpawn(kind: SessionKind): Promise<void> {
     const host = await palette.pickHost();
-    if (host) spawnSession(kind, host.name);
+    if (host) await connectSession(kind, host.name);
   }
 
   type Selector = { kind: 'dashboard' | 'snippets'; label: MessageKey; icon: IconName };

@@ -20,7 +20,7 @@ use omnyssh_core::ssh::key_setup::{
     KeySetupStep, KeySource, KeyType,
 };
 use omnyssh_core::ssh::keys::{discover_keys, inspect_key};
-use omnyssh_core::ssh::session::{set_default_identity, SshSession};
+use omnyssh_core::ssh::session::{key_is_unlocked, set_default_identity, unlock_key, SshSession};
 
 use crate::dto::{AuthModeDto, HostAuthDto, KeyChoiceDto, SshKeyDto};
 use crate::error::CommandError;
@@ -50,6 +50,36 @@ pub async fn inspect_ssh_key(path: String) -> Result<SshKeyDto, CommandError> {
         inspect_key(&PathBuf::from(&path))
             .map(|k| SshKeyDto::from(&k))
             .ok_or_else(|| err(format!("{path} is not an SSH private key")))
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Whether an encrypted key still needs its passphrase in this app process. The
+/// passphrase itself is never persisted; an unlocked key becomes locked again when
+/// OmnySSH exits.
+#[tauri::command]
+#[specta::specta]
+pub async fn key_passphrase_required(path: String) -> Result<bool, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = expand_tilde(&path);
+        let key = inspect_key(&path)
+            .ok_or_else(|| err(format!("{} is not an SSH private key", path.display())))?;
+        Ok(key.encrypted && !key_is_unlocked(&path))
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Validate an encrypted key's passphrase and retain it in zeroizing process memory.
+/// It is never written to `hosts.toml`, app settings, logs, or the frontend again.
+#[tauri::command]
+#[specta::specta]
+pub async fn unlock_ssh_key(path: String, passphrase: String) -> Result<(), CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = expand_tilde(&path);
+        unlock_key(&path, passphrase)
+            .map_err(|_| err("The key could not be unlocked. Check its passphrase and try again."))
     })
     .await
     .map_err(err)?
@@ -111,7 +141,7 @@ pub fn start_key_setup(
     key: KeyChoiceDto,
     mode: AuthModeDto,
 ) -> Result<(), CommandError> {
-    let host = state
+    let mut host = state
         .host_by_name(&host_name)
         .ok_or_else(|| err(format!("unknown host '{host_name}'")))?;
     let source = match key {
@@ -122,7 +152,15 @@ pub fn start_key_setup(
             }
             KeySource::Generate { file_name }
         }
-        KeyChoiceDto::Existing { path } => KeySource::Existing(expand_tilde(&path)),
+        KeyChoiceDto::Existing { path } => {
+            let path = expand_tilde(&path);
+            // The chosen key may already be authorised on the server (the common
+            // "select my corporate key" flow). Try it during the setup connection,
+            // before falling back to the host's password. On success it is persisted
+            // by `persist_key` below; until then this change is runtime-only.
+            host.identity_file = Some(path.to_string_lossy().into_owned());
+            KeySource::Existing(path)
+        }
     };
     let options = KeySetupOptions {
         key_type: KeyType::Ed25519,
