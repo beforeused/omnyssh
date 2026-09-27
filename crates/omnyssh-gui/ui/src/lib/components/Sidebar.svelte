@@ -28,12 +28,13 @@
     if (host) await connectSession(kind, host.name);
   }
 
-  type Selector = { kind: 'dashboard' | 'snippets'; label: MessageKey; icon: IconName };
+  type Selector = { kind: 'dashboard' | 'snippets' | 'keys'; label: MessageKey; icon: IconName };
   type Spawner = { kind: SessionKind; label: MessageKey; icon: IconName };
 
   const selectors: Selector[] = [
     { kind: 'dashboard', label: 'nav.dashboard', icon: 'dashboard' },
-    { kind: 'snippets', label: 'nav.snippets', icon: 'snippets' }
+    { kind: 'snippets', label: 'nav.snippets', icon: 'snippets' },
+    { kind: 'keys', label: 'nav.keys', icon: 'key' }
   ];
   const spawners: Spawner[] = [
     { kind: 'sftp', label: 'nav.sftp', icon: 'sftp' },
@@ -46,6 +47,12 @@
   const focusRing = 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus';
   const rowState = (active: boolean): string =>
     active ? 'bg-accent text-accent-fg' : 'text-muted hover:bg-surface-inset hover:text-fg';
+
+  function select(kind: Selector['kind']): void {
+    if (kind === 'dashboard') activeEntity.selectDashboard();
+    else if (kind === 'snippets') activeEntity.selectSnippets();
+    else activeEntity.selectKeys();
+  }
 </script>
 
 <aside
@@ -79,8 +86,7 @@
               : ''}"
             title={$t(sel.label)}
             aria-current={$activeEntity.kind === sel.kind ? 'page' : undefined}
-            onclick={() =>
-              sel.kind === 'dashboard' ? activeEntity.selectDashboard() : activeEntity.selectSnippets()}
+            onclick={() => select(sel.kind)}
           >
             <Icon name={sel.icon} />
             {#if !$sidebarCollapsed}<span class="truncate">{$t(sel.label)}</span>{/if}

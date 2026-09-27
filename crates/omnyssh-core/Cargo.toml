@@ -15,6 +15,9 @@ tokio = { workspace = true }
 russh = "0.46"
 russh-sftp = "2.0"
 russh-keys = "0.46"
+# Generates OpenSSH-compatible Ed25519 keys in-process, including encrypted
+# private keys, so a passphrase never appears in a child process argument list.
+ssh-key = { version = "0.6", features = ["ed25519", "encryption", "getrandom"] }
 # Concurrent in-flight SFTP requests in the transfer engine (FuturesUnordered/Ordered).
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 

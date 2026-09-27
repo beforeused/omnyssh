@@ -459,6 +459,8 @@ pub struct KeySetupStepDto {
 }
 
 /// A private key found in `~/.ssh` (or picked by hand), for the key pickers.
+/// `encrypted` marks a passphrase-protected private half; `publicKey` is the
+/// shareable public half and is absent only when it cannot be read without one.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SshKeyDto {
@@ -468,8 +470,9 @@ pub struct SshKeyDto {
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
-    /// Passphrase-protected: usable only through the SSH agent.
     pub encrypted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 impl From<&SshKeyInfo> for SshKeyDto {
@@ -480,6 +483,7 @@ impl From<&SshKeyInfo> for SshKeyDto {
             kind: k.kind.clone(),
             comment: k.comment.clone(),
             encrypted: k.encrypted,
+            public_key: k.public_key.clone(),
         }
     }
 }

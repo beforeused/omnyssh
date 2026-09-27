@@ -336,6 +336,23 @@ export async function inspectSshKey(path: string): Promise<SshKeyDto> {
   return res.data;
 }
 
+/** Create an Ed25519 key pair in ~/.ssh without overwriting an existing file. */
+export async function createSshKey(
+  name: string,
+  comment: string,
+  passphrase: string
+): Promise<SshKeyDto> {
+  const res = await commands.createSshKey(name, comment, passphrase);
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+/** Add another person's public key to the selected server account. */
+export async function installPublicKey(hostName: string, publicKey: string): Promise<void> {
+  const res = await commands.installPublicKey(hostName, publicKey);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
 export async function getDefaultKey(): Promise<string | null> {
   const res = await commands.getDefaultKey();
   if (res.status === 'error') throw new Error(res.error.message);

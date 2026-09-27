@@ -23,17 +23,21 @@ export async function connectSession(
   options?: SpawnOptions
 ): Promise<Session | undefined> {
   try {
-    const auth = await hostAuth(hostName);
-    const keyPath = auth.identityFile ?? (await getDefaultKey());
-    if (keyPath && (await keyPassphraseRequired(keyPath))) {
-      const proceed = await keyPassphrasePrompt.request({ hostName, keyPath });
-      if (!proceed) return undefined;
-    }
+    if (!(await prepareHostAuthentication(hostName))) return undefined;
     return spawnSession(kind, hostName, options);
   } catch (error) {
     lastError.set(error instanceof Error ? error.message : String(error));
     return undefined;
   }
+}
+
+/** Ensure the key selected for `hostName` is usable before a backend action opens
+ * a fresh SSH connection. Returns false when the user cancels the passphrase prompt. */
+export async function prepareHostAuthentication(hostName: string): Promise<boolean> {
+  const auth = await hostAuth(hostName);
+  const keyPath = auth.identityFile ?? (await getDefaultKey());
+  if (!keyPath || !(await keyPassphraseRequired(keyPath))) return true;
+  return keyPassphrasePrompt.request({ hostName, keyPath });
 }
 
 // A tab may veto its own close (an SFTP tab with transfers still running asks

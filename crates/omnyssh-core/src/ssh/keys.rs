@@ -5,11 +5,12 @@
 //! pickers. [`public_key_line`] returns the `authorized_keys` line for a private
 //! key, from its `.pub` sibling or — when that is missing — derived from the key.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use russh_keys::PublicKeyBase64;
+use ssh_key::{rand_core::OsRng, Algorithm, LineEnding, PrivateKey};
 
 /// A private key found on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,8 +22,10 @@ pub struct SshKeyInfo {
     pub kind: Option<String>,
     /// The public key's comment (often `user@host`).
     pub comment: Option<String>,
-    /// Protected by a passphrase (the app cannot use it without the agent).
+    /// Protected by a passphrase and requiring an unlock before direct use.
     pub encrypted: bool,
+    /// Shareable public half, when it can be read without asking for a passphrase.
+    pub public_key: Option<String>,
 }
 
 /// Private keys are small; anything larger is not one.
@@ -36,6 +39,148 @@ const PRIVATE_MARKERS: &[&str] = &[
     "-----BEGIN PRIVATE KEY-----",
     "-----BEGIN ENCRYPTED PRIVATE KEY-----",
 ];
+
+/// Create an Ed25519 key pair in `~/.ssh` without invoking a child process.
+/// Existing files are never overwritten. The optional passphrase is used only
+/// while encrypting the private key and is not persisted separately.
+pub fn create_key_pair(
+    file_name: &str,
+    comment: &str,
+    passphrase: &str,
+) -> anyhow::Result<SshKeyInfo> {
+    let directory = dirs::home_dir()
+        .ok_or_else(|| anyhow!("Cannot determine home directory"))?
+        .join(".ssh");
+    create_key_pair_in(&directory, file_name, comment, passphrase)
+}
+
+fn create_key_pair_in(
+    directory: &Path,
+    file_name: &str,
+    comment: &str,
+    passphrase: &str,
+) -> anyhow::Result<SshKeyInfo> {
+    validate_key_file_name(file_name)?;
+    let comment = comment.trim();
+    if comment.len() > 256 || comment.chars().any(char::is_control) {
+        anyhow::bail!("The key comment is too long or contains invalid characters");
+    }
+    if passphrase.len() > 1024 {
+        anyhow::bail!("The key passphrase is too long");
+    }
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("Failed to create {}", directory.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .with_context(|| format!("Failed to set permissions on {}", directory.display()))?;
+
+    let private_path = directory.join(file_name);
+    let public_path = directory.join(format!("{file_name}.pub"));
+    if private_path.exists() || public_path.exists() {
+        anyhow::bail!("A key named '{file_name}' already exists");
+    }
+
+    let mut private = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+        .context("Failed to generate an Ed25519 key")?;
+    if !comment.is_empty() {
+        private.set_comment(comment);
+    }
+    // `ssh-key` intentionally omits the public comment from the outer encrypted
+    // envelope, so encode the public half before encrypting the private half.
+    let public_text = private
+        .public_key()
+        .to_openssh()
+        .context("Failed to encode the public key")?;
+    if !passphrase.is_empty() {
+        private = private
+            .encrypt(&mut OsRng, passphrase)
+            .context("Failed to encrypt the private key")?;
+    }
+    let private_text = private
+        .to_openssh(LineEnding::LF)
+        .context("Failed to encode the private key")?;
+
+    let mut private_created = false;
+    let mut public_created = false;
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut private_file = new_private_file(&private_path)?;
+        private_created = true;
+        private_file
+            .write_all(private_text.as_bytes())
+            .with_context(|| format!("Failed to write {}", private_path.display()))?;
+        private_file
+            .sync_all()
+            .with_context(|| format!("Failed to sync {}", private_path.display()))?;
+
+        let mut public_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&public_path)
+            .with_context(|| format!("Failed to create {}", public_path.display()))?;
+        public_created = true;
+        writeln!(public_file, "{public_text}")
+            .with_context(|| format!("Failed to write {}", public_path.display()))?;
+        public_file
+            .sync_all()
+            .with_context(|| format!("Failed to sync {}", public_path.display()))?;
+        Ok(())
+    })();
+
+    if let Err(error) = write_result {
+        if private_created {
+            let _ = std::fs::remove_file(&private_path);
+        }
+        if public_created {
+            let _ = std::fs::remove_file(&public_path);
+        }
+        return Err(error);
+    }
+
+    inspect_key(&private_path).ok_or_else(|| anyhow!("The created SSH key could not be read"))
+}
+
+fn new_private_file(path: &Path) -> anyhow::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("Failed to create {}", path.display()))
+}
+
+/// A safe plain file name inside `~/.ssh`.
+pub fn validate_key_file_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("The key name is empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!("The key name is longer than 64 characters");
+    }
+    if name.starts_with('.') || name.starts_with('-') {
+        anyhow::bail!("The key name cannot start with '.' or '-'");
+    }
+    if name.ends_with(".pub") {
+        anyhow::bail!("The key name cannot end with .pub");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        anyhow::bail!("The key name may only contain letters, digits, '.', '_' and '-'");
+    }
+    const RESERVED: &[&str] = &["config", "known_hosts", "authorized_keys", "environment"];
+    if RESERVED.contains(&name) || name.starts_with("known_hosts") {
+        anyhow::bail!("'{name}' is a file ssh already uses");
+    }
+    Ok(())
+}
 
 /// The private keys in `~/.ssh`, sorted by name.
 pub fn discover_keys() -> Vec<SshKeyInfo> {
@@ -77,8 +222,11 @@ pub fn inspect_key(path: &Path) -> Option<SshKeyInfo> {
         return None;
     }
     let name = path.file_name()?.to_string_lossy().into_owned();
-    let (mut kind, comment) = read_public_sibling(path)
-        .map(|line| parse_public_line(&line))
+    let public_sibling =
+        read_public_sibling(path).filter(|line| validate_public_line(line).is_ok());
+    let (mut kind, comment) = public_sibling
+        .as_deref()
+        .map(parse_public_line)
         .unwrap_or((None, None));
     let loaded = russh_keys::load_secret_key(path, None);
     let encrypted = loaded.is_err() && head.contains("ENCRYPTED")
@@ -88,12 +236,18 @@ pub fn inspect_key(path: &Path) -> Option<SshKeyInfo> {
             kind = Some(short_kind(key.name()));
         }
     }
+    let public_key = public_sibling.or_else(|| {
+        let key = loaded.as_ref().ok()?;
+        let public = key.clone_public_key().ok()?;
+        Some(format!("{} {}", public.name(), public.public_key_base64()))
+    });
     Some(SshKeyInfo {
         path: path.to_path_buf(),
         name,
         kind,
         comment,
         encrypted,
+        public_key,
     })
 }
 
@@ -157,19 +311,34 @@ pub fn public_key_line(private: &Path) -> anyhow::Result<String> {
 /// A public key line safe to put into `authorized_keys` via a shell command.
 pub fn validate_public_line(line: &str) -> anyhow::Result<()> {
     let line = line.trim();
-    // Single quotes are fine: the authorized_keys command escapes them.
-    if line.contains(['\n', '\r', '\0']) {
+    const MAX_PUBLIC_KEY_LINE_BYTES: usize = 16 * 1024;
+    if line.is_empty() || line.len() > MAX_PUBLIC_KEY_LINE_BYTES {
+        anyhow::bail!("the public key is empty or too long");
+    }
+    // Single quotes are fine: the authorized_keys command escapes them. Control
+    // characters are not useful in a bare key line and make review misleading.
+    if line.chars().any(char::is_control) {
         anyhow::bail!("the public key contains invalid characters");
     }
-    let known = [
-        "ssh-ed25519 ",
-        "ssh-rsa ",
-        "ecdsa-sha2-",
-        "sk-ssh-ed25519@openssh.com ",
-        "sk-ecdsa-sha2-",
-    ];
-    if !known.iter().any(|k| line.starts_with(k)) {
+    let mut parts = line.split_whitespace();
+    let algorithm = parts
+        .next()
+        .ok_or_else(|| anyhow!("the public key type is missing"))?;
+    let encoded = parts
+        .next()
+        .ok_or_else(|| anyhow!("the public key data is missing"))?;
+    let known = algorithm == "ssh-ed25519"
+        || algorithm == "ssh-rsa"
+        || algorithm.starts_with("ecdsa-sha2-")
+        || algorithm == "sk-ssh-ed25519@openssh.com"
+        || algorithm.starts_with("sk-ecdsa-sha2-");
+    if !known {
         anyhow::bail!("unrecognised public key type");
+    }
+    let parsed = russh_keys::parse_public_key_base64(encoded)
+        .map_err(|_| anyhow!("the public key data is invalid"))?;
+    if parsed.name() != algorithm {
+        anyhow::bail!("the public key type does not match its data");
     }
     Ok(())
 }
@@ -196,9 +365,12 @@ mod tests {
 
     #[test]
     fn unsafe_public_lines_are_refused() {
-        assert!(validate_public_line("ssh-ed25519 AAAA me").is_ok());
+        let valid =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILagOJFgwaMNhBWQINinKOXmqS4Gh5NgxgriXwdOoINJ me";
+        assert!(validate_public_line(valid).is_ok());
         assert!(validate_public_line("ssh-ed25519 AAAA\r rm -rf ~").is_err());
         assert!(validate_public_line("ssh-ed25519 AAAA\nssh-rsa BBBB").is_err());
+        assert!(validate_public_line("ssh-ed25519 AAAA me").is_err());
         assert!(validate_public_line("garbage").is_err());
     }
 
@@ -228,5 +400,39 @@ mod tests {
         let derived = public_key_line(&d.join("work")).unwrap();
         let blob = |l: &str| l.split_whitespace().nth(1).unwrap().to_string();
         assert_eq!(blob(&from_pub), blob(&derived));
+    }
+
+    #[test]
+    fn creates_encrypted_key_pair_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = create_key_pair_in(dir.path(), "friend_access", "me@test", "secret").unwrap();
+        assert!(key.encrypted);
+        assert_eq!(key.comment.as_deref(), Some("me@test"));
+        assert!(key.public_key.as_deref().is_some_and(|line| {
+            line.starts_with("ssh-ed25519 ") && line.ends_with(" me@test")
+        }));
+        assert!(russh_keys::load_secret_key(&key.path, Some("secret")).is_ok());
+        assert!(create_key_pair_in(dir.path(), "friend_access", "", "").is_err());
+    }
+
+    #[test]
+    fn key_creation_preserves_a_preexisting_public_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let public = dir.path().join("shared.pub");
+        std::fs::write(&public, "someone else's file\n").unwrap();
+
+        assert!(create_key_pair_in(dir.path(), "shared", "", "").is_err());
+        assert_eq!(
+            std::fs::read_to_string(public).unwrap(),
+            "someone else's file\n"
+        );
+        assert!(!dir.path().join("shared").exists());
+    }
+
+    #[test]
+    fn key_creation_rejects_multiline_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(create_key_pair_in(dir.path(), "safe", "ok\ninjected", "").is_err());
+        assert!(!dir.path().join("safe").exists());
     }
 }

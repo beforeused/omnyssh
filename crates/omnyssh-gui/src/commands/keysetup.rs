@@ -6,6 +6,7 @@
 //! the key is written onto the host in `hosts.toml` (an `~/.ssh/config` import is
 //! adopted first, as editing does), so a `reload_hosts` shows it on the card.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use tauri::{AppHandle, Manager, State};
@@ -16,10 +17,12 @@ use omnyssh_core::config::app_config::{load_app_config, save_default_identity};
 use omnyssh_core::config::{load_hosts, save_hosts};
 use omnyssh_core::ssh::client::{Host, HostSource};
 use omnyssh_core::ssh::key_setup::{
-    setup_key_with_options, validate_key_file_name, AuthMode, KeySetupOptions, KeySetupState,
-    KeySetupStep, KeySource, KeyType,
+    install_public_key as install_public_key_on_session, setup_key_with_options, AuthMode,
+    KeySetupOptions, KeySetupState, KeySetupStep, KeySource, KeyType,
 };
-use omnyssh_core::ssh::keys::{discover_keys, inspect_key};
+use omnyssh_core::ssh::keys::{
+    create_key_pair, discover_keys, inspect_key, validate_key_file_name, validate_public_line,
+};
 use omnyssh_core::ssh::session::{key_is_unlocked, set_default_identity, unlock_key, SshSession};
 
 use crate::dto::{AuthModeDto, HostAuthDto, KeyChoiceDto, SshKeyDto};
@@ -36,10 +39,29 @@ fn err(e: impl std::fmt::Display) -> CommandError {
 /// The private keys in `~/.ssh`, for the key pickers.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_ssh_keys() -> Result<Vec<SshKeyDto>, CommandError> {
-    tauri::async_runtime::spawn_blocking(|| discover_keys().iter().map(SshKeyDto::from).collect())
-        .await
-        .map_err(err)
+pub async fn list_ssh_keys(state: State<'_, GuiState>) -> Result<Vec<SshKeyDto>, CommandError> {
+    let mut configured = state.configured_identity_files();
+    if let Ok(config) = load_app_config(None) {
+        if let Some(default) = config.general.default_identity_file {
+            configured.push(default);
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut keys = discover_keys();
+        let mut paths: HashSet<PathBuf> = keys.iter().map(|key| key.path.clone()).collect();
+        for path in configured {
+            let path = expand_tilde(&path);
+            if paths.insert(path.clone()) {
+                if let Some(key) = inspect_key(&path) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys.sort_by_key(|key| key.name.to_lowercase());
+        keys.iter().map(SshKeyDto::from).collect()
+    })
+    .await
+    .map_err(err)
 }
 
 /// Describe a key file the user picked by hand. Errors when it is not a private key.
@@ -50,6 +72,31 @@ pub async fn inspect_ssh_key(path: String) -> Result<SshKeyDto, CommandError> {
         inspect_key(&PathBuf::from(&path))
             .map(|k| SshKeyDto::from(&k))
             .ok_or_else(|| err(format!("{path} is not an SSH private key")))
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Create a local Ed25519 key pair in `~/.ssh`. A passphrase, when provided, is
+/// used to encrypt the private key and retained only in the process unlock cache.
+#[tauri::command]
+#[specta::specta]
+pub async fn create_ssh_key(
+    name: String,
+    comment: String,
+    passphrase: String,
+) -> Result<SshKeyDto, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let passphrase = zeroize::Zeroizing::new(passphrase);
+        let key = create_key_pair(name.trim(), comment.trim(), passphrase.as_str()).map_err(err)?;
+        if !passphrase.is_empty() {
+            unlock_key(&key.path, passphrase.to_string()).map_err(|e| {
+                err(format!(
+                    "The key was created but could not be unlocked: {e}"
+                ))
+            })?;
+        }
+        Ok(SshKeyDto::from(&key))
     })
     .await
     .map_err(err)?
@@ -127,6 +174,30 @@ pub fn host_auth(
         identity_file: host.identity_file.clone(),
         has_password: host.password.as_deref().is_some_and(|p| !p.is_empty()),
     })
+}
+
+/// Add a shareable public key to the remote account's `authorized_keys`. The
+/// connection uses the host's existing authentication; no local identity setting
+/// or password-authentication policy is changed.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_public_key(
+    state: State<'_, GuiState>,
+    host_name: String,
+    public_key: String,
+) -> Result<(), CommandError> {
+    validate_public_line(public_key.trim()).map_err(err)?;
+    let host = state
+        .host_by_name(&host_name)
+        .ok_or_else(|| err(format!("unknown host '{host_name}'")))?;
+    let session = SshSession::connect(&host)
+        .await
+        .map_err(|e| err(format!("Connection failed: {e:#}")))?;
+    let result = install_public_key_on_session(&session, public_key.trim())
+        .await
+        .map_err(|e| err(format!("{e:#}")));
+    session.disconnect().await;
+    result
 }
 
 /// Install a key on `host_name` (tech-gui.md §4.2): a new one or `key`, with

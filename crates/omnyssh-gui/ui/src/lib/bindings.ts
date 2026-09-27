@@ -545,6 +545,18 @@ async startKeySetup(hostName: string, key: KeyChoiceDto, mode: AuthModeDto) : Pr
 }
 },
 /**
+ * Create a local Ed25519 key pair in `~/.ssh`. A passphrase, when provided, is
+ * used to encrypt the private key and retained only in the process unlock cache.
+ */
+async createSshKey(name: string, comment: string, passphrase: string) : Promise<Result<SshKeyDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_ssh_key", { name, comment, passphrase }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The private keys in `~/.ssh`, for the key pickers.
  */
 async listSshKeys() : Promise<Result<SshKeyDto[], CommandError>> {
@@ -621,6 +633,19 @@ async setDefaultKey(path: string | null) : Promise<Result<null, CommandError>> {
 async hostAuth(hostName: string) : Promise<Result<HostAuthDto, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("host_auth", { hostName }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Add a shareable public key to the remote account's `authorized_keys`. The
+ * connection uses the host's existing authentication; no local identity setting
+ * or password-authentication policy is changed.
+ */
+async installPublicKey(hostName: string, publicKey: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_public_key", { hostName, publicKey }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1038,12 +1063,10 @@ export type SnippetResult = { hostName: string; snippetName: string; ok: boolean
 export type SnippetScopeDto = "global" | "host"
 /**
  * A private key found in `~/.ssh` (or picked by hand), for the key pickers.
+ * `encrypted` marks a passphrase-protected private half; `publicKey` is the
+ * shareable public half and is absent only when it cannot be read without one.
  */
-export type SshKeyDto = { path: string; name: string; kind?: string | null; comment?: string | null; 
-/**
- * Passphrase-protected: usable only through the SSH agent.
- */
-encrypted: boolean }
+export type SshKeyDto = { path: string; name: string; kind?: string | null; comment?: string | null; encrypted: boolean; publicKey?: string | null }
 /**
  * Raw PTY output bytes for a terminal session's per-session `Channel` (tech-gui.md
  * §3.3/§3.6). Deliberately **not** `Serialize`: that dodges the blanket

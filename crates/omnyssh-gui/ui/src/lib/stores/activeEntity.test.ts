@@ -24,9 +24,11 @@ describe('activeEntity — exactly one active', () => {
     expect(get(activeEntity)).toEqual({ kind: 'dashboard' });
   });
 
-  it('the two selectors are mutually exclusive', () => {
+  it('the selectors are mutually exclusive', () => {
     activeEntity.selectSnippets();
     expect(get(activeEntity)).toEqual({ kind: 'snippets' });
+    activeEntity.selectKeys();
+    expect(get(activeEntity)).toEqual({ kind: 'keys' });
     activeEntity.selectDashboard();
     expect(get(activeEntity)).toEqual({ kind: 'dashboard' });
   });

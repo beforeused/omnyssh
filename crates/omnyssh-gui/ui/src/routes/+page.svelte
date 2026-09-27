@@ -12,18 +12,37 @@
   import AppShell from '$lib/components/AppShell.svelte';
   import Dashboard from '$lib/screens/Dashboard.svelte';
   import Snippets from '$lib/screens/Snippets.svelte';
+  import Keys from '$lib/screens/Keys.svelte';
   import Settings from '$lib/screens/Settings.svelte';
   import TerminalView from '$lib/screens/TerminalView.svelte';
   import SftpView from '$lib/screens/SftpView.svelte';
   import DockerView from '$lib/screens/DockerView.svelte';
   import KeyPassphraseDialog from '$lib/components/KeyPassphraseDialog.svelte';
+  import SharedHostDialog from '$lib/screens/SharedHostDialog.svelte';
+  import { decodeSharedHost, isHostShareText, type SharedHost } from '$lib/share/hostShare';
 
-  onMount(async () => {
-    try {
-      hosts.set(await listHosts());
-    } catch (err) {
-      lastError.set(err instanceof Error ? err.message : String(err));
-    }
+  let sharedImport = $state<SharedHost | null>(null);
+
+  onMount(() => {
+    void listHosts()
+      .then((loaded) => hosts.set(loaded))
+      .catch((err) => lastError.set(err instanceof Error ? err.message : String(err)));
+
+    // Capture before a terminal receives the paste: a recognised share code opens
+    // a review dialog and is never sent as terminal input.
+    const onPaste = (event: ClipboardEvent): void => {
+      const text = event.clipboardData?.getData('text/plain') ?? '';
+      if (!isHostShareText(text)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      try {
+        sharedImport = decodeSharedHost(text);
+      } catch (reason) {
+        lastError.set(reason instanceof Error ? reason.message : String(reason));
+      }
+    };
+    window.addEventListener('paste', onPaste, true);
+    return () => window.removeEventListener('paste', onPaste, true);
   });
 
   const activeSessionId = $derived($activeEntity.kind === 'session' ? $activeEntity.id : null);
@@ -32,6 +51,7 @@
   const selectorActive = $derived(
     $activeEntity.kind === 'dashboard' ||
       $activeEntity.kind === 'snippets' ||
+      $activeEntity.kind === 'keys' ||
       $activeEntity.kind === 'settings'
   );
 </script>
@@ -57,6 +77,8 @@
             <Dashboard />
           {:else if $activeEntity.kind === 'snippets'}
             <Snippets />
+          {:else if $activeEntity.kind === 'keys'}
+            <Keys />
           {:else if $activeEntity.kind === 'settings'}
             <Settings />
           {/if}
@@ -67,3 +89,6 @@
 </AppShell>
 
 <KeyPassphraseDialog />
+{#if sharedImport}
+  <SharedHostDialog shared={sharedImport} onClose={() => (sharedImport = null)} />
+{/if}

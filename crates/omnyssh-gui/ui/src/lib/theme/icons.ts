@@ -38,6 +38,7 @@ export type IconName =
   | 'arrow-up'
   | 'archive'
   | 'copy'
+  | 'share'
   | 'stop'
   | 'pause'
   | 'list';

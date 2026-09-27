@@ -21,6 +21,7 @@
   import KeySetupDialog from './KeySetupDialog.svelte';
   import { t } from '$lib/i18n';
   import Modal from '$lib/components/Modal.svelte';
+  import { encodeSharedHost } from '$lib/share/hostShare';
 
   type Dialog =
     | { kind: 'add' }
@@ -29,6 +30,7 @@
     | { kind: 'key'; host: HostDto };
 
   let dialog = $state<Dialog | null>(null);
+  let sharedHost = $state<string | null>(null);
 
   // Host search (task 6): a round toggle slides a filter field out to its left and the
   // grid filters live. Frontend-only, like the snippet search — the core stays untouched.
@@ -96,6 +98,18 @@
       lastError.set(message(e));
     }
     dialog = null;
+  }
+
+  async function share(host: HostDto): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(encodeSharedHost(host));
+      sharedHost = host.name;
+      setTimeout(() => {
+        if (sharedHost === host.name) sharedHost = null;
+      }, 1800);
+    } catch (e) {
+      lastError.set(message(e));
+    }
   }
 
   // Shared pill used by the header/empty-state "Add host" and the per-card quick actions.
@@ -273,6 +287,15 @@
                 onclick={() => (dialog = { kind: 'key', host: card.host })}
               >
                 <Icon name="key" size={14} />
+              </button>
+              <button
+                type="button"
+                class={iconBtn}
+                title={$t('share.button', { host: card.host.name })}
+                aria-label={$t('share.button', { host: card.host.name })}
+                onclick={() => void share(card.host)}
+              >
+                <Icon name={sharedHost === card.host.name ? 'check' : 'share'} size={14} />
               </button>
               <!-- Editing an import adopts it into hosts.toml (§4.2); ~/.ssh/config is
                    never written, so the action is offered whatever the source. Delete

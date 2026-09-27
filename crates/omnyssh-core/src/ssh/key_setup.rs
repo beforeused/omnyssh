@@ -19,6 +19,7 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::ssh::client::Host;
+use crate::ssh::keys::validate_key_file_name;
 use crate::ssh::session::{self, SshSession};
 
 // ---------------------------------------------------------------------------
@@ -292,37 +293,6 @@ pub async fn generate_named_key_pair(
     generate_key_pair_file(file_name, host_name, key_type).await
 }
 
-/// A key file name the user typed: a plain file name inside `~/.ssh` — no
-/// folders, no leading dot, no `.pub`, and only `A–Z a–z 0–9 . _ -`.
-///
-/// # Errors
-/// Describes what is wrong with the name.
-pub fn validate_key_file_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        anyhow::bail!("The key name is empty");
-    }
-    if name.len() > 64 {
-        anyhow::bail!("The key name is longer than 64 characters");
-    }
-    if name.starts_with('.') || name.starts_with('-') {
-        anyhow::bail!("The key name cannot start with '.' or '-'");
-    }
-    if name.ends_with(".pub") {
-        anyhow::bail!("The key name cannot end with .pub");
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
-        anyhow::bail!("The key name may only contain letters, digits, '.', '_' and '-'");
-    }
-    const RESERVED: &[&str] = &["config", "known_hosts", "authorized_keys", "environment"];
-    if RESERVED.contains(&name) || name.starts_with("known_hosts") {
-        anyhow::bail!("'{name}' is a file ssh already uses");
-    }
-    Ok(())
-}
-
 async fn generate_key_pair_file(
     key_filename: &str,
     host_name: &str,
@@ -479,26 +449,32 @@ pub fn sanitize_hostname(hostname: &str) -> String {
 ///
 /// The command creates ~/.ssh if it doesn't exist, appends the key (never overwrites),
 /// and sets correct permissions.
-pub fn build_authorized_keys_command(public_key: &str) -> String {
+pub fn build_authorized_keys_command(public_key: &str) -> Result<String> {
     // Validate public key is a single line matching expected SSH format.
     let public_key = public_key.trim();
-    if public_key.contains('\n') || public_key.contains('\r') || public_key.contains('\0') {
-        panic!("Public key file contains invalid characters");
-    }
-    if crate::ssh::keys::validate_public_line(public_key).is_err() {
-        panic!("Public key file has unrecognized key type");
-    }
+    crate::ssh::keys::validate_public_line(public_key)?;
 
     // Escape single quotes in the public key.
     let escaped_key = public_key.replace('\'', "'\\''");
 
     // Idempotent: a key that is already authorised is not appended again.
-    format!(
+    Ok(format!(
         r#"mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
            touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && \
            {{ grep -qxF -- '{escaped_key}' ~/.ssh/authorized_keys || \
               echo '{escaped_key}' >> ~/.ssh/authorized_keys; }}"#
-    )
+    ))
+}
+
+/// Add another person's public key to the connected account without changing the
+/// local identity or the server's password-authentication policy.
+pub async fn install_public_key(session: &SshSession, public_key: &str) -> Result<()> {
+    let command = build_authorized_keys_command(public_key).context("Invalid public key")?;
+    session
+        .run_command_checked(&command)
+        .await
+        .context("Failed to add the public key to authorized_keys")?;
+    Ok(())
 }
 
 /// Builds the command to disable password authentication in sshd_config.
@@ -797,8 +773,13 @@ async fn setup_key_internal(
         return Err(anyhow!("Public key file: {e}"));
     }
 
-    let copy_cmd = build_authorized_keys_command(public_key_trimmed);
-    match time::timeout(STEP_TIMEOUT, password_session.run_command(&copy_cmd)).await {
+    let copy_cmd = build_authorized_keys_command(public_key_trimmed)?;
+    match time::timeout(
+        STEP_TIMEOUT,
+        password_session.run_command_checked(&copy_cmd),
+    )
+    .await
+    {
         Ok(Ok(_)) => {
             machine.step_result(KeySetupStep::CopyPublicKey, Ok(()));
         }
@@ -1241,8 +1222,8 @@ mod tests {
 
     #[test]
     fn test_authorized_keys_command_escapes_quotes() {
-        let pubkey = "ssh-ed25519 AAAA... user's key";
-        let cmd = build_authorized_keys_command(pubkey);
+        let pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILagOJFgwaMNhBWQINinKOXmqS4Gh5NgxgriXwdOoINJ user's key";
+        let cmd = build_authorized_keys_command(pubkey).unwrap();
 
         // Should escape single quotes.
         assert!(cmd.contains("user'\\''s"));
@@ -1250,6 +1231,12 @@ mod tests {
         assert!(cmd.contains(">> ~/.ssh/authorized_keys"));
         // Should NOT use > (overwrite).
         assert!(!cmd.contains(" > ~/.ssh/authorized_keys"));
+    }
+
+    #[test]
+    fn invalid_public_key_never_builds_a_remote_command() {
+        assert!(build_authorized_keys_command("ssh-ed25519 not-base64").is_err());
+        assert!(build_authorized_keys_command("ssh-ed25519 AAAA\nrm -rf ~").is_err());
     }
 
     #[test]

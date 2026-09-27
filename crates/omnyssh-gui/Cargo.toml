@@ -29,6 +29,7 @@ tokio = { workspace = true }
 chrono = { workspace = true }
 # Home directory for finding editors installed per-user (~/Applications, ~/.local/bin).
 dirs = { workspace = true }
+zeroize = { workspace = true }
 # Local deletes go to the Trash (recoverable) rather than being unlinked.
 trash = "5"
 # tauri-specta v2 + specta v2 are release candidates (tech-gui.md §3.3): pin exact

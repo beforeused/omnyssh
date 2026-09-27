@@ -169,6 +169,17 @@ impl GuiState {
             .cloned()
     }
 
+    /// Private-key paths explicitly referenced by configured hosts. Used only to
+    /// include keys kept outside `~/.ssh` on the local Keys screen.
+    pub fn configured_identity_files(&self) -> Vec<String> {
+        self.hosts
+            .read()
+            .expect("hosts lock poisoned")
+            .iter()
+            .filter_map(|host| host.identity_file.clone())
+            .collect()
+    }
+
     /// Trigger an immediate metric poll of every host (tech-gui.md §4.2). A no-op if
     /// the pollers have not started yet. Non-blocking — it only nudges the poller tasks.
     pub fn refresh_metrics(&self) {

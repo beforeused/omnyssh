@@ -12,6 +12,7 @@
   import {
     hostAuth,
     inspectSshKey,
+    installPublicKey,
     keyPassphraseRequired,
     startKeySetup,
     unlockSshKey
@@ -26,11 +27,12 @@
   } from '$lib/stores/keys';
   import { beginKeySetup, dismissKeySetup } from '$lib/stores/keySetup';
   import { lastError } from '$lib/stores/notifications';
+  import { prepareHostAuthentication } from '$lib/stores/navigation';
 
   let { host, onClose }: { host: HostDto; onClose: () => void } = $props();
 
   let currentKey = $state<string | null>(null);
-  let tab = $state<'existing' | 'new'>('existing');
+  let tab = $state<'existing' | 'new' | 'public'>('existing');
   let keyPath = $state('');
   /** Keys picked by hand from outside ~/.ssh, listed alongside the found ones. */
   let extraKeys = $state<SshKeyDto[]>([]);
@@ -44,6 +46,9 @@
   // svelte-ignore state_referenced_locally
   let mode = $state<AuthModeDto>(host.passwordAuthDisabled ? 'keyOnly' : 'keyAndPassword');
   let starting = $state(false);
+  let publicKey = $state('');
+  let publicError = $state<string | null>(null);
+  let publicDone = $state(false);
 
   const keys = $derived([
     ...$sshKeys,
@@ -67,7 +72,11 @@
 
   const canStart = $derived(
     !starting &&
-      (tab === 'new' ? nameError === null : keyPath !== '' && (!needsPassphrase || passphrase !== ''))
+      (tab === 'new'
+        ? nameError === null
+        : tab === 'existing'
+          ? keyPath !== '' && (!needsPassphrase || passphrase !== '')
+          : publicKey.trim() !== '')
   );
 
   async function chooseKey(path: string): Promise<void> {
@@ -126,6 +135,20 @@
   async function start(): Promise<void> {
     if (!canStart) return;
     starting = true;
+    if (tab === 'public') {
+      publicError = null;
+      try {
+        if (!(await prepareHostAuthentication(host.name))) return;
+        await installPublicKey(host.name, publicKey.trim());
+        publicKey = '';
+        publicDone = true;
+      } catch (e) {
+        publicError = e instanceof Error ? e.message : String(e);
+      } finally {
+        starting = false;
+      }
+      return;
+    }
     passphraseError = null;
     if (tab === 'existing' && needsPassphrase) {
       try {
@@ -219,6 +242,15 @@
           >
             {$t('keysetup.tabNew')}
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'public'}
+            class="{tabBtn} {tabState(tab === 'public')}"
+            onclick={() => (tab = 'public')}
+          >
+            {$t('keysetup.tabPublic')}
+          </button>
         </div>
 
         {#if tab === 'existing'}
@@ -294,7 +326,7 @@
               {/if}
             {/if}
           </div>
-        {:else}
+        {:else if tab === 'new'}
           <label class="block space-y-1.5">
             <span class="text-xs font-medium text-muted">{$t('keysetup.keyName')}</span>
             <span
@@ -315,9 +347,35 @@
           {:else}
             <p class="mt-1.5 text-xs text-faint">{$t('keysetup.keyNameHint', { name: newName.trim() })}</p>
           {/if}
+        {:else}
+          {#if publicDone}
+            <div class="rounded-xl border border-status-ok/40 bg-surface-inset px-3.5 py-3">
+              <p class="flex items-center gap-2 text-sm text-status-ok">
+                <Icon name="check" size={14} />{$t('keysetup.publicDone')}
+              </p>
+              <p class="mt-1 text-xs text-muted">{$t('keysetup.publicDoneHint')}</p>
+            </div>
+          {:else}
+            <p class="mb-2 text-xs text-faint">{$t('keysetup.publicHint')}</p>
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-muted">{$t('keysetup.publicLabel')}</span>
+              <textarea
+                bind:value={publicKey}
+                rows="5"
+                maxlength="16384"
+                spellcheck="false"
+                autocomplete="off"
+                placeholder="ssh-ed25519 AAAA… name@computer"
+                class="w-full resize-y rounded-lg bg-surface-inset px-3 py-2 font-mono text-xs text-fg outline-none focus-visible:ring-2 focus-visible:ring-focus"
+              ></textarea>
+            </label>
+            <p class="mt-1.5 text-[11px] text-faint">{$t('keysetup.publicSafety')}</p>
+            {#if publicError}<p class="mt-2 text-xs text-status-crit">{publicError}</p>{/if}
+          {/if}
         {/if}
       </section>
 
+      {#if tab !== 'public'}
       <section class="space-y-2">
         <h3 class={section}>{$t('keysetup.modeSection')}</h3>
         <label class="{radio} {cardState(mode === 'keyAndPassword')}">
@@ -338,11 +396,18 @@
           </span>
         </label>
       </section>
+      {/if}
     </div>
 
     <footer class="flex justify-end gap-2 border-t border-default px-5 py-3">
-      <Button variant="ghost" onclick={onClose}>{$t('common.cancel')}</Button>
-      <Button variant="primary" type="submit" disabled={!canStart}>{$t('keysetup.install')}</Button>
+      {#if publicDone}
+        <Button variant="primary" onclick={onClose}>{$t('common.done')}</Button>
+      {:else}
+        <Button variant="ghost" onclick={onClose}>{$t('common.cancel')}</Button>
+        <Button variant="primary" type="submit" disabled={!canStart}>
+          {tab === 'public' ? $t('keysetup.addPublic') : $t('keysetup.install')}
+        </Button>
+      {/if}
     </footer>
   </form>
 </Modal>
